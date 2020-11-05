@@ -193,6 +193,10 @@ def selinux_present():
     """
     status = False
 
+    if not shutil.which("semanage"):
+        log.error('semanage command not found, will not relabel ports.' )
+        return status
+
     try:
         import selinux
         if selinux.is_selinux_enabled():
