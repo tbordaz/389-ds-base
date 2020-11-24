@@ -269,6 +269,7 @@ def test_sync_repl_cookie(topology, request):
       13.: succeeds
     """
     inst = topology[0]
+    inst.restart()
 
     # Enable/configure retroCL
     plugin = RetroChangelogPlugin(inst)
@@ -293,12 +294,14 @@ def test_sync_repl_cookie(topology, request):
 
     # Add the automember config entry
     am_configs = AutoMembershipDefinitions(inst)
+    am_configs_cleanup = []
     for g in group:
         am_config = am_configs.create(properties={'cn': 'config %s' % g.get_attr_val_utf8('cn'),
                                                   'autoMemberScope': DEFAULT_SUFFIX,
                                                   'autoMemberFilter': 'uid=*',
                                                   'autoMemberDefaultGroup': g.dn,
                                                   'autoMemberGroupingAttr': 'member:dn'})
+        am_configs_cleanup.append(am_config)
 
     # Enable and configure memberof plugin
     plugin = MemberOfPlugin(inst)
@@ -308,9 +311,13 @@ def test_sync_repl_cookie(topology, request):
     plugin.replace_groupattr('member')
 
     memberof_config = MemberOfSharedConfig(inst, 'cn=memberOf config,{}'.format(DEFAULT_SUFFIX))
-    memberof_config.create(properties={'cn': 'memberOf config',
-                                       'memberOfGroupAttr': 'member',
-                                       'memberOfAttr': 'memberof'})
+    try:
+        memberof_config.create(properties={'cn': 'memberOf config',
+                                           'memberOfGroupAttr': 'member',
+                                           'memberOfAttr': 'memberof'})
+    except ldap.ALREADY_EXISTS:
+        pass
+
     # Enable plugin log level (usefull for debug)
     inst.setLogLevel(65536)
     inst.restart()
@@ -353,6 +360,8 @@ def test_sync_repl_cookie(topology, request):
                 user.delete()
             except:
                 pass
+        for am_config in am_configs_cleanup:
+            am_config.delete()
         for g in group:
             try:
                 g.delete()
@@ -401,6 +410,7 @@ def test_sync_repl_cookie_add_del(topology, request):
       14.: succeeds
     """
     inst = topology[0]
+    inst.restart()
 
     # Enable/configure retroCL
     plugin = RetroChangelogPlugin(inst)
@@ -421,16 +431,21 @@ def test_sync_repl_cookie_add_del(topology, request):
     groups = Groups(inst, DEFAULT_SUFFIX)
     group = []
     for i in range(1,3):
-        group.append(groups.create(properties={'cn': 'group%d' % i}))
+        try:
+            group.append(groups.create(properties={'cn': 'group%d' % i}))
+        except ldap.ALREADY_EXISTS:
+            pass
 
     # Add the automember config entry
     am_configs = AutoMembershipDefinitions(inst)
+    am_configs_cleanup = []
     for g in group:
         am_config = am_configs.create(properties={'cn': 'config %s' % g.get_attr_val_utf8('cn'),
                                                   'autoMemberScope': DEFAULT_SUFFIX,
                                                   'autoMemberFilter': 'uid=*',
                                                   'autoMemberDefaultGroup': g.dn,
                                                   'autoMemberGroupingAttr': 'member:dn'})
+        am_configs_cleanup.append(am_config)
 
     # Enable and configure memberof plugin
     plugin = MemberOfPlugin(inst)
@@ -440,9 +455,13 @@ def test_sync_repl_cookie_add_del(topology, request):
     plugin.replace_groupattr('member')
 
     memberof_config = MemberOfSharedConfig(inst, 'cn=memberOf config,{}'.format(DEFAULT_SUFFIX))
-    memberof_config.create(properties={'cn': 'memberOf config',
-                                       'memberOfGroupAttr': 'member',
-                                       'memberOfAttr': 'memberof'})
+    try:
+        memberof_config.create(properties={'cn': 'memberOf config',
+                                           'memberOfGroupAttr': 'member',
+                                           'memberOfAttr': 'memberof'})
+    except ldap.ALREADY_EXISTS:
+        pass
+
     # Enable plugin log level (usefull for debug)
     inst.setLogLevel(65536)
     inst.restart()
@@ -483,6 +502,8 @@ def test_sync_repl_cookie_add_del(topology, request):
 
     def fin():
         inst.restart()
+        for am_config in am_configs_cleanup:
+            am_config.delete()
         for g in group:
             try:
                 g.delete()
@@ -533,6 +554,7 @@ def test_sync_repl_cookie_with_failure(topology, request):
       14.: succeeds
     """
     inst = topology[0]
+    inst.restart()
 
     # Enable/configure retroCL
     plugin = RetroChangelogPlugin(inst)
@@ -553,7 +575,10 @@ def test_sync_repl_cookie_with_failure(topology, request):
     groups = Groups(inst, DEFAULT_SUFFIX)
     group = []
     for i in range(1,5):
-        group.append(groups.create(properties={'cn': 'group%d' % i}))
+        try:
+            group.append(groups.create(properties={'cn': 'group%d' % i}))
+        except ldap.ALREADY_EXISTS:
+            pass
 
     # Set group2 as a groupOfUniqueNames so that automember will fail to update that group
     # This will trigger a failure in internal MOD and a failure to add member
@@ -576,9 +601,12 @@ def test_sync_repl_cookie_with_failure(topology, request):
     plugin.replace_groupattr('member')
 
     memberof_config = MemberOfSharedConfig(inst, 'cn=memberOf config,{}'.format(DEFAULT_SUFFIX))
-    memberof_config.create(properties={'cn': 'memberOf config',
-                                       'memberOfGroupAttr': 'member',
-                                       'memberOfAttr': 'memberof'})
+    try:
+        memberof_config.create(properties={'cn': 'memberOf config',
+                                           'memberOfGroupAttr': 'member',
+                                           'memberOfAttr': 'memberof'})
+    except ldap.ALREADY_EXISTS:
+        pass
 
     # Enable plugin log level (usefull for debug)
     inst.setLogLevel(65536)
