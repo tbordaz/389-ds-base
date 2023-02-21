@@ -349,7 +349,7 @@ endif
 serverplugin_LTLIBRARIES = libacl-plugin.la \
 	libaddn-plugin.la \
 	libattr-unique-plugin.la \
-	libautomember-plugin.la libback-ldbm.la libchainingdb-plugin.la \
+	libautomember-plugin.la libtest_slapi_memberof-plugin.la libback-ldbm.la libchainingdb-plugin.la \
 	libcollation-plugin.la libcos-plugin.la libderef-plugin.la \
 	libpbe-plugin.la libdistrib-plugin.la \
 	liblinkedattrs-plugin.la libmanagedentries-plugin.la \
@@ -1349,6 +1349,16 @@ libautomember_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(DSPLUGIN_CPPFLAGS)
 libautomember_plugin_la_LIBADD = libslapd.la $(NSPR_LINK)
 libautomember_plugin_la_DEPENDENCIES = libslapd.la
 libautomember_plugin_la_LDFLAGS = -avoid-version
+
+#------------------------
+# libtest_slapi_memberof-plugin
+#------------------------
+libtest_slapi_memberof_plugin_la_SOURCES = ldap/servers/plugins/tests/test_slapi_memberof.c
+
+libtest_slapi_memberof_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(DSPLUGIN_CPPFLAGS)
+libtest_slapi_memberof_plugin_la_LIBADD = libslapd.la $(NSPR_LINK)
+libtest_slapi_memberof_plugin_la_DEPENDENCIES = libslapd.la
+libtest_slapi_memberof_plugin_la_LDFLAGS = -avoid-version
 
 #------------------------
 # libattr-unique-plugin
