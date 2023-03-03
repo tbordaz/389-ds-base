@@ -1257,6 +1257,9 @@ char get_sep(char *path);
 int mkdir_p(char *dir, unsigned int mode);
 const char *ldif_getline_ro( const char **next);
 void dup_ldif_line(struct berval *copy, const char *line, const char *endline);
+int slapi_memberof(Slapi_MemberOfConfig *config, Slapi_DN *member_sdn, Slapi_MemberOfResult *result);
+void slapi_memberof_free_memberof_plugin_config();
+int slapi_memberof_load_memberof_plugin_config();
 
 /* lenstr stuff */
 
