@@ -46,7 +46,8 @@ do_search(Slapi_PBlock *pb)
     char *rawbase = NULL;
     int rawbase_set_in_pb = 0; /* was rawbase set in pb? */
     char *base = NULL, *fstr = NULL;
-    struct slapi_filter *filter = NULL;
+    Slapi_Filter *filter = NULL;
+    Slapi_Filter *filter_exec = NULL;
     char **attrs = NULL;
     char **gerattrs = NULL;
     int psearch = 0;
@@ -419,7 +420,12 @@ do_search(Slapi_PBlock *pb)
 free_and_return:
     if (!psearch || rc != 0 || err != 0) {
         slapi_ch_free_string(&fstr);
+        if (filter_exec && (filter_exec != filter)) {
+            slapi_filter_free(filter_exec, 1 /* recurse */);
+            slapi_pblock_set(pb, SLAPI_SEARCH_FILTER_INTENDED, NULL);
+        }
         slapi_filter_free(filter, 1);
+        slapi_pblock_set(pb, SLAPI_SEARCH_FILTER, NULL);
         slapi_pblock_get(pb, SLAPI_SEARCH_ATTRS, &attrs);
         charray_free(attrs);    /* passing NULL is fine */
         charray_free(gerattrs); /* passing NULL is fine */

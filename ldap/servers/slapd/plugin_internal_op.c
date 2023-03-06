@@ -663,7 +663,8 @@ search_internal_callback_pb(Slapi_PBlock *pb, void *callback_data, plugin_result
 {
     LDAPControl **controls;
     Operation *op;
-    struct slapi_filter *filter = NULL;
+    Slapi_Filter *filter = NULL;
+    Slapi_Filter *filter_exec = NULL;
     char *fstr = NULL;
     struct callback_fn_ptrs callback_handler_data;
     int scope;
@@ -738,10 +739,16 @@ search_internal_callback_pb(Slapi_PBlock *pb, void *callback_data, plugin_result
     slapi_td_internal_op_finish();
 
     slapi_pblock_get(pb, SLAPI_SEARCH_FILTER, &filter);
+    slapi_pblock_get(pb, SLAPI_SEARCH_FILTER_INTENDED, &filter_exec);
 
 done:
     slapi_ch_free_string(&fstr);
+    if (filter_exec && (filter_exec != filter)) {
+        slapi_filter_free(filter_exec, 1 /* recurse */);
+        slapi_pblock_set(pb, SLAPI_SEARCH_FILTER_INTENDED, NULL);
+    }
     slapi_filter_free(filter, 1 /* recurse */);
+    slapi_pblock_set(pb, SLAPI_SEARCH_FILTER, NULL);
     slapi_pblock_get(pb, SLAPI_SEARCH_ATTRS, &tmp_attrs);
     /* coverity[callee_ptr_arith] */
     slapi_ch_array_free(tmp_attrs);
