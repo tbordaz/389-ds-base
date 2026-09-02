@@ -128,6 +128,9 @@
 #include <unistd.h>
 #endif /* USE_SYSCONF */
 #include "slap.h"
+#ifdef ENABLE_HIBP
+#include "hibp.h"
+#endif
 #include "plhash.h"
 #if defined(LINUX)
 #include <malloc.h>
@@ -213,6 +216,7 @@ slapi_onoff_t init_pw_exp;
 slapi_onoff_t init_pw_send_expiring;
 slapi_onoff_t init_pw_palindrome;
 slapi_onoff_t init_pw_dict_check;
+slapi_onoff_t init_pw_breach_check;
 slapi_onoff_t init_allow_hashed_pw;
 slapi_onoff_t init_pw_syntax;
 slapi_onoff_t init_schemacheck;
@@ -245,6 +249,7 @@ slapi_onoff_t init_close_on_failed_bind;
 slapi_onoff_t init_minssf_exclude_rootdse;
 slapi_onoff_t init_force_sasl_external;
 slapi_onoff_t init_slapi_counters;
+slapi_onoff_t init_thread_pool_stats;
 slapi_onoff_t init_entryusn_global;
 slapi_onoff_t init_disk_monitoring;
 slapi_onoff_t init_disk_threshold_readonly;
@@ -583,6 +588,21 @@ static struct config_get_and_set
      NULL, 0,
      (void **)&global_slapdFrontendConfig.pw_policy.pw_bad_words,
      CONFIG_STRING, NULL, "", NULL},
+    /* password breach check */
+    {CONFIG_PW_BREACH_CHECK_ATTRIBUTE, config_set_pw_breach_check,
+     NULL, 0,
+     (void **)&global_slapdFrontendConfig.pw_policy.pw_check_breach,
+     CONFIG_ON_OFF, NULL, &init_pw_breach_check, NULL},
+    /* password breach database URL */
+    {CONFIG_PW_BREACH_URL_ATTRIBUTE, config_set_pw_breach_url,
+     NULL, 0,
+     (void **)&global_slapdFrontendConfig.pw_policy.pw_breach_db_url,
+     CONFIG_STRING, NULL, "", NULL},
+    /* password breach database timeout */
+    {CONFIG_PW_BREACH_TIMEOUT_ATTRIBUTE, config_set_pw_breach_timeout,
+     NULL, 0,
+     (void **)&global_slapdFrontendConfig.pw_policy.pw_breach_db_timeout,
+     CONFIG_INT, NULL, "10", NULL},
     /* password max sequence */
     {CONFIG_PW_MAX_SEQ_ATTRIBUTE, config_set_pw_max_seq,
      NULL, 0,
@@ -956,6 +976,11 @@ static struct config_get_and_set
      (void **)&global_slapdFrontendConfig.slapi_counters,
      CONFIG_ON_OFF, (ConfigGetFunc)config_get_slapi_counters,
      &init_slapi_counters, NULL},
+    {CONFIG_THREAD_POOL_STATS_ATTRIBUTE, config_set_thread_pool_stats,
+     NULL, 0,
+     (void **)&global_slapdFrontendConfig.thread_pool_stats,
+     CONFIG_ON_OFF, (ConfigGetFunc)config_get_thread_pool_stats,
+     &init_thread_pool_stats, NULL},
     {CONFIG_ACCESSLOG_MINFREEDISKSPACE_ATTRIBUTE, NULL,
      log_set_mindiskspace, SLAPD_ACCESS_LOG,
      (void **)&global_slapdFrontendConfig.accesslog_minfreespace,
@@ -1479,6 +1504,11 @@ static struct config_get_and_set
      (void **)&global_slapdFrontendConfig.fgot,
      CONFIG_STRING, (ConfigGetFunc)config_get_fgot,
      SLAPD_DEFAULT_FGOT, NULL },
+    {CONFIG_MAXCONTROLS_PER_OP_ATTRIBUTE, config_set_maxcontrolsperop,
+     NULL, 0,
+     (void **)&global_slapdFrontendConfig.maxcontrols_per_op,
+     CONFIG_INT, (ConfigGetFunc)config_get_maxcontrolsperop,
+     SLAPD_DEFAULT_MAXCONTROLS_PER_OP_STR, NULL},
     {CONFIG_IGNORED_CRITICALITY_LIST_ATTRIBUTE,
      config_set_ignored_criticality_list, NULL, 0,
      (void **)&global_slapdFrontendConfig.ignored_criticality_list,
@@ -1750,6 +1780,9 @@ pwpolicy_init_defaults (passwdPolicy *pw_policy)
     pw_policy->pw_admin_user = NULL;
     pw_policy->pw_is_legacy = LDAP_ON;
     pw_policy->pw_track_update_time = LDAP_OFF;
+    pw_policy->pw_check_breach = LDAP_OFF;
+    pw_policy->pw_breach_db_url = NULL;
+    pw_policy->pw_breach_db_timeout = 10;
 }
 
 static void
@@ -1767,6 +1800,7 @@ pwpolicy_fe_init_onoff(passwdPolicy *pw_policy)
     init_pw_track_update_time = pw_policy->pw_track_update_time;
     init_pw_palindrome = pw_policy->pw_palindrome;
     init_pw_dict_check = pw_policy->pw_check_dict;
+    init_pw_breach_check = pw_policy->pw_check_breach;
 }
 
 void
@@ -1859,6 +1893,7 @@ FrontendConfig_init(void)
     init_close_on_failed_bind = cfg->close_on_failed_bind = LDAP_OFF;
     cfg->allow_anon_access = SLAPD_DEFAULT_ALLOW_ANON_ACCESS;
     init_slapi_counters = cfg->slapi_counters = LDAP_ON;
+    init_thread_pool_stats = cfg->thread_pool_stats = LDAP_ON;
     cfg->threadnumber = util_get_hardware_threads();
     cfg->maxthreadsperconn = SLAPD_DEFAULT_MAX_THREADS_PER_CONN;
     cfg->reservedescriptors = SLAPD_DEFAULT_RESERVE_FDS;
@@ -2059,6 +2094,7 @@ FrontendConfig_init(void)
     init_cn_uses_dn_syntax_in_dns = cfg->cn_uses_dn_syntax_in_dns = LDAP_OFF;
     init_global_backend_local = LDAP_OFF;
     cfg->maxsimplepaged_per_conn = SLAPD_DEFAULT_MAXSIMPLEPAGED_PER_CONN;
+    cfg->maxcontrols_per_op = SLAPD_DEFAULT_MAXCONTROLS_PER_OP;
     cfg->maxbersize = SLAPD_DEFAULT_MAXBERSIZE;
     cfg->logging_backend = slapi_ch_strdup(SLAPD_INIT_LOGGING_BACKEND_INTERNAL);
     cfg->rootdn = slapi_ch_strdup(SLAPD_DEFAULT_DIRECTORY_MANAGER);
@@ -2230,6 +2266,11 @@ alloc_global_snmp_vars()
 
 /* Allocated the next slots of the arrays of counters
  * with a slot per worker thread
+ *
+ * Must complete before any reader of per_thread_snmp_vars starts (worker
+ * threads, snmp collator, thread-pool stats heartbeat): the slot count and
+ * the array pointer are published without synchronization, and the realloc
+ * frees the old array under a concurrent reader.
  */
 void
 alloc_per_thread_snmp_vars(int32_t maxthread)
@@ -3439,6 +3480,23 @@ config_set_slapi_counters(const char *attrname, char *value, char *errorbuf, int
     return retVal;
 }
 
+/*
+ * Enable/disable the thread-pool status diagnostics (mmap file, "dsctl
+ * thread-pool status", threadpoolworker on cn=monitor). Read once at
+ * startup; changing it requires a restart.
+ */
+int32_t
+config_set_thread_pool_stats(const char *attrname, char *value, char *errorbuf, int apply)
+{
+    int32_t retVal = LDAP_SUCCESS;
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+
+    retVal = config_set_onoff(attrname, value,
+                              &(slapdFrontendConfig->thread_pool_stats), errorbuf, apply);
+
+    return retVal;
+}
+
 int
 config_set_securelistenhost(const char *attrname __attribute__((unused)), char *value, char *errorbuf __attribute__((unused)), int apply)
 {
@@ -3788,6 +3846,127 @@ config_set_pw_dict_path(const char *attrname, char *value, char *errorbuf, int a
         CFG_LOCK_WRITE(slapdFrontendConfig);
         slapi_ch_free_string(&slapdFrontendConfig->pw_policy.pw_dict_path);
         slapdFrontendConfig->pw_policy.pw_dict_path = slapi_ch_strdup(value);
+        CFG_UNLOCK_WRITE(slapdFrontendConfig);
+    }
+    return retVal;
+}
+
+int32_t
+config_set_pw_breach_check(const char *attrname, char *value, char *errorbuf, int apply)
+{
+    int32_t retVal = LDAP_SUCCESS;
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+
+#ifndef ENABLE_HIBP
+    if (value && strcasecmp(value, "on") == 0) {
+        slapi_create_errormsg(errorbuf, SLAPI_DSE_RETURNTEXT_SIZE,
+                              "%s: HIBP breached password checking is not available. "
+                              "Rebuild with --enable-hibp to enable this feature.", attrname);
+        slapi_log_err(SLAPI_LOG_ERR, "config_set_pw_breach_check",
+                      "HIBP breached password checking is not available - "
+                      "rebuild with --enable-hibp to enable this feature\n");
+        return LDAP_UNWILLING_TO_PERFORM;
+    }
+#endif
+
+    retVal = config_set_onoff(attrname,
+                              value,
+                              &(slapdFrontendConfig->pw_policy.pw_check_breach),
+                              errorbuf,
+                              apply);
+
+    return retVal;
+}
+
+int32_t
+config_set_pw_breach_url(const char *attrname, char *value, char *errorbuf, int apply)
+{
+    int32_t retVal = LDAP_SUCCESS;
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+    size_t len;
+
+#ifndef ENABLE_HIBP
+    if (apply && value && strlen(value) > 0) {
+        slapi_log_err(SLAPI_LOG_WARNING, "config_set_pw_breach_url",
+                      "HIBP breached password checking not enabled - passwordBreachDbUrl has no effect\n");
+    }
+#endif
+
+    if (config_value_is_null(attrname, value, errorbuf, 0)) {
+        value = NULL;
+    }
+
+    /* Validate URL if provided */
+    if (value && strlen(value) > 0) {
+        /* Require https:// endpoint for security */
+        if (strncasecmp(value, "https://", 8) != 0) {
+            slapi_create_errormsg(errorbuf, SLAPI_DSE_RETURNTEXT_SIZE,
+                                  "%s: URL must use https://", attrname);
+            return LDAP_UNWILLING_TO_PERFORM;
+        }
+        /* Require trailing slash for correct URL construction */
+        len = strlen(value);
+        if (value[len - 1] != '/') {
+            slapi_create_errormsg(errorbuf, SLAPI_DSE_RETURNTEXT_SIZE,
+                                  "%s: URL must end with a trailing slash (e.g., https://api.pwnedpasswords.com/range/)",
+                                  attrname);
+            return LDAP_UNWILLING_TO_PERFORM;
+        }
+    }
+
+    if (apply) {
+        CFG_LOCK_WRITE(slapdFrontendConfig);
+        slapi_ch_free_string(&slapdFrontendConfig->pw_policy.pw_breach_db_url);
+        slapdFrontendConfig->pw_policy.pw_breach_db_url = slapi_ch_strdup(value);
+        CFG_UNLOCK_WRITE(slapdFrontendConfig);
+    }
+    return retVal;
+}
+
+char *
+config_get_pw_breach_url(void)
+{
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+    char *retVal;
+
+    CFG_LOCK_READ(slapdFrontendConfig);
+    retVal = slapi_ch_strdup(slapdFrontendConfig->pw_policy.pw_breach_db_url);
+    CFG_UNLOCK_READ(slapdFrontendConfig);
+
+    return retVal;
+}
+
+int32_t
+config_set_pw_breach_timeout(const char *attrname, char *value, char *errorbuf, int apply)
+{
+    int32_t retVal = LDAP_SUCCESS;
+    int32_t timeout;
+    char *endp = NULL;
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+
+#ifndef ENABLE_HIBP
+    if (apply) {
+        slapi_log_err(SLAPI_LOG_WARNING, "config_set_pw_breach_timeout",
+                      "HIBP breached password checking not enabled  - passwordBreachDbTimeout has no effect\n");
+    }
+#endif
+
+    if (config_value_is_null(attrname, value, errorbuf, 0)) {
+        return LDAP_OPERATIONS_ERROR;
+    }
+
+    errno = 0;
+    timeout = strtol(value, &endp, 10);
+    if (*endp != '\0' || errno == ERANGE || timeout < 1 || timeout > 300) {
+        slapi_create_errormsg(errorbuf, SLAPI_DSE_RETURNTEXT_SIZE,
+                              "%s: invalid value \"%s\". Must be between 1 and 300.",
+                              attrname, value);
+        return LDAP_OPERATIONS_ERROR;
+    }
+
+    if (apply) {
+        CFG_LOCK_WRITE(slapdFrontendConfig);
+        slapdFrontendConfig->pw_policy.pw_breach_db_timeout = timeout;
         CFG_UNLOCK_WRITE(slapdFrontendConfig);
     }
     return retVal;
@@ -6336,6 +6515,13 @@ config_get_slapi_counters()
 
 }
 
+int32_t
+config_get_thread_pool_stats(void)
+{
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+    return slapi_atomic_load_32(&(slapdFrontendConfig->thread_pool_stats), __ATOMIC_ACQUIRE);
+}
+
 char *
 config_get_workingdir(void)
 {
@@ -7365,6 +7551,19 @@ config_get_pw_warning(void)
 
     CFG_LOCK_READ(slapdFrontendConfig);
     retVal = slapdFrontendConfig->pw_policy.pw_warning;
+    CFG_UNLOCK_READ(slapdFrontendConfig);
+
+    return retVal;
+}
+
+int32_t
+config_get_pwpolicy_local(void)
+{
+    int32_t retVal;
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+
+    CFG_LOCK_READ(slapdFrontendConfig);
+    retVal = slapdFrontendConfig->pwpolicy_local;
     CFG_UNLOCK_READ(slapdFrontendConfig);
 
     return retVal;
@@ -10147,6 +10346,52 @@ config_get_maxsimplepaged_per_conn()
     int retVal;
 
     retVal = slapdFrontendConfig->maxsimplepaged_per_conn;
+    return retVal;
+}
+
+int
+config_set_maxcontrolsperop(const char *attrname, char *value, char *errorbuf, int apply)
+{
+    int retVal = LDAP_SUCCESS;
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+    long size;
+    char *endp;
+
+    if (config_value_is_null(attrname, value, errorbuf, 0)) {
+        return LDAP_OPERATIONS_ERROR;
+    }
+
+    errno = 0;
+    size = strtol(value, &endp, 10);
+    if (*endp != '\0' || errno == ERANGE || size < 1 || size > 1000) {
+        slapi_create_errormsg(errorbuf, SLAPI_DSE_RETURNTEXT_SIZE,
+                              "(%s) value (%s) is invalid, must be at least 1 and less than 1000\n",
+                              attrname, value);
+        return LDAP_OPERATIONS_ERROR;
+    }
+
+    if (!apply) {
+        return retVal;
+    }
+
+    CFG_LOCK_WRITE(slapdFrontendConfig);
+
+    slapdFrontendConfig->maxcontrols_per_op = size;
+
+    CFG_UNLOCK_WRITE(slapdFrontendConfig);
+    return retVal;
+}
+
+int
+config_get_maxcontrolsperop()
+{
+    slapdFrontendConfig_t *slapdFrontendConfig = getFrontendConfig();
+    int retVal;
+
+    retVal = slapdFrontendConfig->maxcontrols_per_op;
+    if (retVal == 0) {
+        retVal = SLAPD_DEFAULT_MAXCONTROLS_PER_OP;
+    }
     return retVal;
 }
 

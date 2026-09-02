@@ -304,6 +304,8 @@ typedef void (*VFPV)(); /* takes undefined arguments */
 #define SLAPD_DEFAULT_MAXBERSIZE_STR "2097152"
 #define SLAPD_DEFAULT_MAXSIMPLEPAGED_PER_CONN (-1)
 #define SLAPD_DEFAULT_MAXSIMPLEPAGED_PER_CONN_STR "-1"
+#define SLAPD_DEFAULT_MAXCONTROLS_PER_OP 10
+#define SLAPD_DEFAULT_MAXCONTROLS_PER_OP_STR "10"
 #define SLAPD_DEFAULT_LDAPSSOTOKEN_TTL 3600
 #define SLAPD_DEFAULT_LDAPSSOTOKEN_TTL_STR "3600"
 
@@ -1934,6 +1936,9 @@ typedef struct passwordpolicyarray
     Slapi_DN **pw_admin_user;
     slapi_onoff_t pw_admin_skip_info;  /* Skip updating password information in target entry */
     char *pw_local_dn; /* DN of the subtree/user policy */
+    slapi_onoff_t pw_check_breach;     /* Check passwords against HIBP breach database */
+    char *pw_breach_db_url;            /* Custom breach database API URL (default HIBP) */
+    int pw_breach_db_timeout;          /* Timeout for breach database queries in seconds */
 
 } passwdPolicy;
 #define PWDPOLICY_DEBUG "PWDPOLICY_DEBUG"
@@ -1954,6 +1959,13 @@ void slapi_pblock_set_vattr_context(Slapi_PBlock *pb, void *vattr_ctx);
 
 void *slapi_pblock_get_op_stack_elem(Slapi_PBlock *pb);
 void slapi_pblock_set_op_stack_elem(Slapi_PBlock *pb, void *stack_elem);
+
+/*
+ * Wait until deferred memberOf work for this operation completes (or shutdown).
+ * No-op unless memberof armed deferred work on this pblock (lazy sync).
+ * Notify is performed by memberof via SLAPI_DEFERRED_MEMBEROF set to 0.
+ */
+void slapi_pblock_wait_deferred_memberof(Slapi_PBlock *pb);
 
 /* index if substrlens */
 #define INDEX_SUBSTRBEGIN  0
@@ -2293,6 +2305,7 @@ typedef struct _slapdEntryPoints
 #define CONFIG_LDAPI_AUTH_DN_ATTRIBUTE "nsslapd-authenticateAsDN"
 #define CONFIG_ANON_LIMITS_DN_ATTRIBUTE "nsslapd-anonlimitsdn"
 #define CONFIG_SLAPI_COUNTER_ATTRIBUTE "nsslapd-counters"
+#define CONFIG_THREAD_POOL_STATS_ATTRIBUTE "nsslapd-thread-pool-stats"
 #define CONFIG_SECURITY_ATTRIBUTE "nsslapd-security"
 #define CONFIG_SSL3CIPHERS_ATTRIBUTE "nsslapd-SSL3ciphers"
 #define CONFIG_ACCESSLOG_ATTRIBUTE "nsslapd-accesslog"
@@ -2333,6 +2346,9 @@ typedef struct _slapdEntryPoints
 #define CONFIG_PW_DICT_PATH_ATTRIBUTE "passwordDictPath"
 #define CONFIG_PW_USERATTRS_ATTRIBUTE "passwordUserAttributes"
 #define CONFIG_PW_BAD_WORDS_ATTRIBUTE "passwordBadWords"
+#define CONFIG_PW_BREACH_CHECK_ATTRIBUTE "passwordBreachCheck"
+#define CONFIG_PW_BREACH_URL_ATTRIBUTE "passwordBreachDbUrl"
+#define CONFIG_PW_BREACH_TIMEOUT_ATTRIBUTE "passwordBreachDbTimeout"
 #define CONFIG_PW_EXP_ATTRIBUTE "passwordExp"
 #define CONFIG_PW_MAXAGE_ATTRIBUTE "passwordMaxAge"
 #define CONFIG_PW_MINAGE_ATTRIBUTE "passwordMinAge"
@@ -2432,6 +2448,7 @@ typedef struct _slapdEntryPoints
 #define CONFIG_CN_USES_DN_SYNTAX_IN_DNS "nsslapd-cn-uses-dn-syntax-in-dns"
 
 #define CONFIG_MAXSIMPLEPAGED_PER_CONN_ATTRIBUTE "nsslapd-maxsimplepaged-per-conn"
+#define CONFIG_MAXCONTROLS_PER_OP_ATTRIBUTE "nsslapd-maxcontrolsperop"
 #define CONFIG_LOGGING_BACKEND "nsslapd-logging-backend"
 
 #define CONFIG_EXTRACT_PEM "nsslapd-extract-pemfiles"
@@ -2720,6 +2737,7 @@ typedef struct _slapdFrontendConfig
     char *ldapi_auto_dn_suffix;           /* suffix to be appended to auto gen DNs */
     char *ldapi_auto_mapping_base;        /* suffix/subtree containing LDAPI mapping entries */
     slapi_onoff_t slapi_counters;         /* switch to turn slapi_counters on/off */
+    slapi_onoff_t thread_pool_stats;      /* switch to turn thread-pool status diagnostics on/off */
     slapi_onoff_t allow_unauth_binds;     /* switch to enable/disable unauthenticated binds */
     slapi_onoff_t require_secure_binds;   /* switch to require simple binds to use a secure channel */
     slapi_onoff_t allow_anon_access;      /* switch to enable/disable anonymous access */
@@ -2764,6 +2782,7 @@ typedef struct _slapdFrontendConfig
     slapi_onoff_t cn_uses_dn_syntax_in_dns; /* indicates the cn value in dns has dn syntax */
     slapi_onoff_t global_backend_lock;
     slapi_int_t maxsimplepaged_per_conn; /* max simple paged results reqs handled per connection */
+    slapi_int_t maxcontrols_per_op;      /* max LDAP controls allowed per operation */
     slapi_onoff_t enable_nunc_stans; /* Despite the removal of NS, we have to leave the value in
                                       * case someone was setting it.
                                       */

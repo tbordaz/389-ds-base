@@ -586,7 +586,6 @@ dbmdb_import_monitor_threads(ImportJob *job, int *status)
     int count = 1; /* 1 to prevent premature status report */
     const int display_interval = 200;
     time_t time_now = 0;
-    int i = 0;
 
     for (current_worker = job->worker_list; current_worker != NULL;
          current_worker = current_worker->next)
@@ -615,12 +614,13 @@ dbmdb_import_monitor_threads(ImportJob *job, int *status)
     dbmdb_import_clear_progress_history(job);
 
     while (!finished) {
+        size_t max_slots = ctx->workerq.max_slots;
         DS_Sleep(tenthsecond);
         finished = 1;
 
         /* Compute the number of entries processed by the workers */
         entry_processed = 0;
-        for (i=0; i<ctx->workerq.max_slots; i++) {
+        for (size_t i = 0; i < max_slots; i++) {
             entry_processed += slots[i].count;
         }
 
@@ -780,6 +780,25 @@ dbmdb_import_all_done(ImportJob *job, int ret)
         while (index != NULL) {
             index->ai->ai_indexmask &= ~INDEX_OFFLINE;
             index = index->next;
+        }
+        /* Re-enable fsync before going back online, but only if we set it */
+        if (job->nosync_set) {
+            struct ldbminfo *li = (struct ldbminfo *)inst->inst_be->be_database->plg_private;
+            dbmdb_ctx_t *ctx = MDB_CONFIG(li);
+            if (ctx->env) {
+                int nosync_rc = mdb_env_set_flags(ctx->env, MDB_NOSYNC, 0);
+                if (nosync_rc != 0) {
+                    slapi_log_err(SLAPI_LOG_ERR, "dbmdb_import_all_done",
+                                  "Failed to clear MDB_NOSYNC flag "
+                                  "(error %d: %s)\n",
+                                  nosync_rc, mdb_strerror(nosync_rc));
+                } else {
+                    slapi_log_err(SLAPI_LOG_INFO, "dbmdb_import_all_done",
+                                  "MDB_NOSYNC cleared. "
+                                  "Per-commit fsync re-enabled.\n");
+                }
+            }
+            job->nosync_set = 0;
         }
         /* start up the instance */
         rc = dbmdb_instance_start(job->inst->inst_be, DBLAYER_NORMAL_MODE);
@@ -1008,11 +1027,26 @@ error:
         }
     }
     if (0 != ret) {
-        dblayer_instance_close(job->inst->inst_be);
-        if (!(job->flags & (FLAG_DRYRUN | FLAG_UPGRADEDNFORMAT_V1))) {
-            /* If not dryrun NOR upgradedn space */
-            /* if startcfg in the dry run mode, don't touch the db */
-            dbmdb_delete_instance_dir(be);
+        if (job->flags & FLAG_REINDEXING) {
+            /* Reindex only rebuilds secondary indexes from id2entry
+             * which is never modified during reindex. On failure we
+             * must NOT close or delete the instance, just bring the
+             * backend back online so the server can continue operating
+             * or shut down cleanly.
+             */
+            import_log_notice(job, SLAPI_LOG_CRIT, "dbmdb_public_dbmdb_import_main",
+                              "Reindex failed. Indexes may be incomplete."
+                              " The backend is unavailable until offline"
+                              " reindex is performed:"
+                              " stop the server, run 'dsctl <instance> db2index %s',"
+                              " then start the server.",
+                              inst->inst_name);
+        } else {
+            dblayer_instance_close(job->inst->inst_be);
+            if (!(job->flags & (FLAG_DRYRUN | FLAG_UPGRADEDNFORMAT_V1))) {
+                /* Not dryrun nor upgradedn - delete the half-imported db */
+                dbmdb_delete_instance_dir(be);
+            }
         }
     } else {
         if (0 != (ret = dblayer_instance_close(job->inst->inst_be))) {
@@ -1138,6 +1172,30 @@ error:
         priv->dblayer_auto_tune_fn(li);
     }
 
+    /*
+     * If NOSYNC was set by us and not yet cleared (e.g. import thread failed
+     * before reaching dbmdb_import_all_done), clear it now to restore
+     * durability for all backends.
+     */
+    if (job->nosync_set) {
+        struct ldbminfo *li = inst->inst_li;
+        dbmdb_ctx_t *mdb_ctx = MDB_CONFIG(li);
+        if (mdb_ctx->env) {
+            int nosync_rc = mdb_env_set_flags(mdb_ctx->env, MDB_NOSYNC, 0);
+            if (nosync_rc != 0) {
+                slapi_log_err(SLAPI_LOG_ERR, "dbmdb_public_dbmdb_import_main",
+                              "Failed to clear MDB_NOSYNC after import failure "
+                              "(error %d: %s)\n",
+                              nosync_rc, mdb_strerror(nosync_rc));
+            } else {
+                slapi_log_err(SLAPI_LOG_INFO, "dbmdb_public_dbmdb_import_main",
+                              "MDB_NOSYNC cleared after import failure. "
+                              "Per-commit fsync re-enabled.\n");
+            }
+        }
+        job->nosync_set = 0;
+    }
+
     /* Re-enable the ndn cache */
     ndn_cache_dec_import_task();
     dbmdb_clear_dirty_flags(be);
@@ -1225,6 +1283,20 @@ process_db2index_attrs(Slapi_PBlock *pb, ImportCtx_t *ctx)
             if (pt != NULL) {
                 *pt = '\0';
             }
+            if (ldbm_index_entrydn_should_ignore(attrname)) {
+                if (ctx->job && ctx->job->task && ctx->job->inst) {
+                    slapi_task_log_notice(ctx->job->task,
+                                          "%s: Requested to index %s, but the index is no longer applicable",
+                                          ctx->job->inst->inst_name, LDBM_ENTRYDN_STR);
+                }
+                if (ctx->job && ctx->job->inst) {
+                    slapi_log_err(SLAPI_LOG_WARNING,
+                                  "process_db2index_attrs", "%s: Requested to index %s, but the index is no longer applicable\n",
+                                  ctx->job->inst->inst_name, LDBM_ENTRYDN_STR);
+                }
+                slapi_ch_free_string(&attrname);
+                break;
+            }
             slapi_ch_array_add(&ctx->indexAttrs, attrname);
             break;
         case 'T': /* VLV Search to index */
@@ -1292,6 +1364,37 @@ dbmdb_run_ldif2db(Slapi_PBlock *pb)
             job->flags |= FLAG_REINDEXING; /* call dbmdb_index_producer */
             dbmdb_import_init_writer(job, IM_INDEX);
             process_db2index_attrs(pb, job->writer_ctx);
+            /*
+             * If specific indexes were requested but all were skipped
+             * do not fall through to a full rebuild.
+             */
+            {
+                char **req_attrs = NULL;
+                ImportCtx_t *ctx = job->writer_ctx;
+
+                slapi_pblock_get(pb, SLAPI_DB2INDEX_ATTRS, &req_attrs);
+                if (req_attrs && req_attrs[0] && ctx &&
+                    !ctx->indexAttrs && !ctx->indexVlvs) {
+                    if (job->task) {
+                        slapi_task_log_notice(job->task,
+                                              "%s: No applicable indexes to rebuild",
+                                              job->inst->inst_name);
+                    }
+                    slapi_log_err(SLAPI_LOG_INFO, "dbmdb_run_ldif2db",
+                                  "%s: No applicable indexes to rebuild\n",
+                                  job->inst->inst_name);
+                    /* Backend was set busy before we got here */
+                    instance_set_not_busy(job->inst);
+                    if (job->task) {
+                        slapi_task_log_status(job->task, "%s: Finished indexing.",
+                                              job->inst->inst_name);
+                    }
+                    dbmdb_free_import_ctx(job);
+                    dbmdb_import_free_job(job);
+                    FREE(job);
+                    return 0;
+                }
+            }
         }
     } else {
         dbmdb_import_init_writer(job, IM_IMPORT);
@@ -1469,6 +1572,34 @@ dbmdb_bulk_import_start(Slapi_PBlock *pb)
     if (ret != 0)
         goto fail;
 
+    /*
+     * Skip per-commit fsync during bulk import (nsslapd-mdb-online-import-nosync).
+     * Same optimization as dbmdb_ldif2db. The backend is offline so intermediate
+     * durability is not needed. The writer thread calls mdb_env_sync() at the end.
+     * Note: MDB_NOSYNC is environment-level and affects all backends.
+     */
+    if (MDB_CONFIG(li)->dsecfg.online_import_nosync) {
+        dbmdb_ctx_t *ctx = MDB_CONFIG(li);
+        unsigned int env_flags = 0;
+
+        mdb_env_get_flags(ctx->env, &env_flags);
+        if (!(env_flags & MDB_NOSYNC)) {
+            ret = mdb_env_set_flags(ctx->env, MDB_NOSYNC, 1);
+            if (ret != 0) {
+                slapi_log_err(SLAPI_LOG_WARNING, "dbmdb_bulk_import_start",
+                              "Failed to set MDB_NOSYNC (error %d: %s). "
+                              "Import will continue with fsync enabled.\n",
+                              ret, mdb_strerror(ret));
+            } else {
+                job->nosync_set = 1;
+                slapi_log_err(SLAPI_LOG_INFO, "dbmdb_bulk_import_start",
+                              "MDB_NOSYNC enabled for online import "
+                              "(nsslapd-mdb-online-import-nosync: on). "
+                              "Per-commit fsync is disabled until import completes.\n");
+            }
+        }
+    }
+
     /* END OF COPIED SECTION */
 
     pthread_mutex_lock(&job->wire_lock);
@@ -1506,6 +1637,23 @@ dbmdb_bulk_import_start(Slapi_PBlock *pb)
     return 0;
 
 fail:
+    if (job->nosync_set) {
+        dbmdb_ctx_t *ctx = MDB_CONFIG(li);
+        if (ctx->env) {
+            int nosync_rc = mdb_env_set_flags(ctx->env, MDB_NOSYNC, 0);
+            if (nosync_rc != 0) {
+                slapi_log_err(SLAPI_LOG_ERR, "dbmdb_bulk_import_start",
+                              "Failed to clear MDB_NOSYNC on failure path "
+                              "(error %d: %s).\n",
+                              nosync_rc, mdb_strerror(nosync_rc));
+            } else {
+                slapi_log_err(SLAPI_LOG_INFO, "dbmdb_bulk_import_start",
+                              "MDB_NOSYNC cleared on import failure path. "
+                              "Per-commit fsync re-enabled.\n");
+            }
+        }
+        job->nosync_set = 0;
+    }
     PR_Lock(job->inst->inst_config_mutex);
     job->inst->inst_flags &= ~INST_FLAG_BUSY;
     PR_Unlock(job->inst->inst_config_mutex);

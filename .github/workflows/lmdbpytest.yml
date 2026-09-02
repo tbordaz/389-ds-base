@@ -1,8 +1,15 @@
 name: LMDB Test
 
 on:
-  push:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      # not docs/**: slapi.doxy.in and the doxygen assets are build inputs
+      - 'docs/agents/**'
+      - 'docs/design/**'
+      - 'LICENSE*'
+      - '.packit.yaml'
+      - '.github/renovate.json'
   schedule:
     - cron:  '0 0 * * *'
   workflow_dispatch:
@@ -10,7 +17,7 @@ on:
       pytest_tests:
         description: 'Run only specified suites or test modules delimited by space, for example "basic/basic_test.py replication"'
         required: false
-        default: false
+        default: ''
       debug_enabled:
         description: 'Set to "true" to enable debugging with tmate (https://github.com/marketplace/actions/debugging-with-tmate)'
         required: false
@@ -26,24 +33,62 @@ permissions:
   contents: read
 
 jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'schedule'
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Skip the nightly when nothing changed
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Only scheduled successes count: dispatch runs may be partial
+          # (pytest_tests) and this workflow has no push runs.
+          run=true
+          last=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "${{ github.workflow }}" \
+            --event schedule --status success --branch "$GITHUB_REF_NAME" \
+            --limit 1 --json headSha --jq '.[0].headSha' || true)
+          if [ -n "$last" ] && [ "$last" = "$GITHUB_SHA" ]; then
+            echo "No new commits since the last successful scheduled run"
+            run=false
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    needs: gate
+    # != 'success' keeps the gate fail-open: a gate infra failure must
+    # not skip the nightly.
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     container:
       image: quay.io/389ds/ci-images:test
     outputs:
         matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Add GITHUB_WORKSPACE as a safe directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Check if the diff is limited to the Web UI
+        id: scope
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: echo "suites=$(python3 .github/scripts/pr_scope.py ${{ github.event.pull_request.number }})" >>$GITHUB_OUTPUT
+
       - name: Get a list of all test suites
         id: set-matrix
-        run: echo "matrix=$(python3 .github/scripts/generate_matrix.py ${{ github.event.inputs.pytest_tests }})" >>$GITHUB_OUTPUT
+        env:
+          SUITES: ${{ steps.scope.outputs.suites || github.event.inputs.pytest_tests }}
+        run: echo "matrix=$(python3 .github/scripts/generate_matrix.py $SUITES)" >>$GITHUB_OUTPUT
 
       - name: Build RPMs
         run: SKIP_AUDIT_CI=1 make -f rpm.mk dist-bz2 rpms
@@ -52,7 +97,7 @@ jobs:
         run: tar -cvf dist.tar dist/
 
       - name: Upload RPMs
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: rpms
           path: dist.tar
@@ -62,16 +107,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     needs: build
+    # The implicit success() check is false whenever any job in the
+    # transitive needs chain was skipped, so the PR-skipped gate would
+    # skip the tests too (actions/runner#491). Depend on build alone.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     strategy:
       fail-fast: false
+      max-parallel: 6
       matrix: ${{ fromJson(needs.build.outputs.matrix) }}
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
     - name: Setup tmate session
-      uses: mxschmitt/action-tmate@v3
+      uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3
       with:
         limit-access-to-actor: true
       if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug_enabled }}
@@ -83,6 +133,7 @@ jobs:
         sudo cp .github/daemon.json /etc/docker/daemon.json
         sudo systemctl unmask docker
         sudo systemctl start docker
+        sudo apparmor_parser -R /etc/apparmor.d/unix-chkpwd 2>/dev/null || true
 
     - name: Free disk space
       run: |
@@ -100,7 +151,7 @@ jobs:
         df -h
 
     - name: Download RPMs
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
       with:
         name: rpms
 
@@ -110,7 +161,18 @@ jobs:
     - name: Run pytest in a container
       run: |
         set -x
-        CID=$(sudo docker run -d -h server.example.com --ulimit core=-1 --cap-add=SYS_PTRACE --privileged --rm --shm-size=4gb -v ${PWD}:/workspace quay.io/389ds/ci-images:test)
+        # quay.io pulls transiently time out (issue 7528); an implicit pull
+        # by 'docker run' has no retry, so pull explicitly with backoff
+        for i in 1 2 3 4 5; do
+          sudo docker pull quay.io/389ds/ci-images:test && break
+          if [ "$i" -eq 5 ]; then
+            echo "Image pull failed after $i attempts"
+            exit 1
+          fi
+          echo "Pull failed, retrying in $((i * 15))s..."
+          sleep $((i * 15))
+        done
+        CID=$(sudo docker run -d -h server.example.com --ulimit core=-1 --cap-add=SYS_PTRACE --privileged --rm --shm-size=4gb --sysctl net.ipv4.ip_local_reserved_ports=38900-39399 -v ${PWD}:/workspace quay.io/389ds/ci-images:test)
         until sudo docker exec $CID sh -c "systemctl is-system-running"
         do
           echo "Waiting for container to be ready..."
@@ -127,19 +189,24 @@ jobs:
     - name: Make the results file readable by all
       if: always()
       run: |
-        sudo chmod -f -v -R a+r pytest.*ml assets
-        sudo chmod -f -v a+x assets
+        sudo chmod -f -v -R a+r pytest.*ml assets || true
+        sudo chmod -f -v a+x assets || true
+        if [ -d .playwright-screenshots ]; then
+          sudo chmod -f -v -R a+r .playwright-screenshots
+          sudo chmod -f -v a+x .playwright-screenshots
+        fi
     - name: Sanitize filename
       if: always()
       run: echo "PYTEST_SUITE=$(echo ${{ matrix.suite }} | sed -e 's#\/#-#g')" >> $GITHUB_ENV
 
     - name: Upload pytest test results
       if: always()
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: pytest-${{ env.PYTEST_SUITE }}
+        include-hidden-files: true
         path: |
           pytest.xml
           pytest.html
           assets
-
+          .playwright-screenshots

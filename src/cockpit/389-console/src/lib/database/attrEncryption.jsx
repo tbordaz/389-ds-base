@@ -85,7 +85,7 @@ export class AttrEncryption extends React.Component {
         ];
         log_cmd("handleAddEncryptedAttr", "Delete suffix referral", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     this.props.reload(this.props.suffix);
                     this.props.addNotification(
@@ -121,7 +121,7 @@ export class AttrEncryption extends React.Component {
         ];
         log_cmd("delEncryptedAttr", "Delete encrypted attribute", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     this.props.reload(this.props.suffix);
                     this.props.addNotification(
@@ -169,7 +169,7 @@ export class AttrEncryption extends React.Component {
         }
 
         return (
-            <div className={saving || modalSpinning ? "ds-margin-top-lg ds-disabled" : "ds-margin-top-lg"}>
+            <div className={saving || modalSpinning ? "ds-margin-top-lg ds-left-margin ds-disabled" : "ds-margin-top-lg ds-left-margin"}>
                 <EncryptedAttrTable
                     key={this.props.rows}
                     rows={this.props.rows}

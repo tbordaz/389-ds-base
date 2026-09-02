@@ -1118,6 +1118,25 @@ char *slapi_entry2str_with_options(Slapi_Entry *e, int *len, int options);
 char *slapi_entry2str(Slapi_Entry *e, int *len);
 
 /**
+ * Generates an LDIF string description of an LDAP entry, omitting excluded attributes.
+ *
+ * This function behaves like slapi_entry2str(), but attributes that appear
+ * in \c exclude_attrs are not included in the output. The entry itself
+ * is not modified.
+ *
+ * \param e Entry that you want to convert into an LDIF string.
+ * \param len Length of the LDIF string returned by this function.
+ * \param exclude_attrs NULL terminated array of attribute names to omit.
+ * \return The LDIF string representation of the entry you specify.
+ * \return \c NULL if an error occurs.
+ * \warning When you no longer need to use the string, you should free it
+ *          from memory by calling the slapi_ch_free_string() function.
+ *
+ * \see slapi_entry2str()
+ */
+char *slapi_entry2str_exclude_attrs(Slapi_Entry *e, int *len, char **exclude_attrs);
+
+/**
  * Allocates memory for a new entry of the data type #Slapi_Entry.
  *
  * This function returns an empty #Slapi_Entry structure. You can call other
@@ -5391,6 +5410,15 @@ int slapi_matchingrule_get(Slapi_MatchingRuleEntry *mr, int arg, void *value);
 int slapi_matchingrule_set(Slapi_MatchingRuleEntry *mr, int arg, void *value);
 int slapi_matchingrule_register(Slapi_MatchingRuleEntry *mrEntry);
 int slapi_matchingrule_unregister(char *oid);
+
+/**
+ * Is the given matching rule an ordering matching rule
+ *
+ * \param name_or_oid Name or OID of a matching rule
+ * \return \c TRUE if the matching rule is an ordering rule
+ * \return \c FALSE otherwise
+ */
+int slapi_matchingrule_is_ordering_only(const char *oid_or_name);
 
 /**
  * Is the given matching rule an ordering matching rule and is it

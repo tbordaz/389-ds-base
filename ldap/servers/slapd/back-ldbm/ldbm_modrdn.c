@@ -22,7 +22,7 @@ static int moddn_newrdn_mods(Slapi_PBlock *pb, const char *olddn, struct backent
 static IDList *moddn_get_children(back_txn *ptxn, Slapi_PBlock *pb, backend *be, struct backentry *parententry, Slapi_DN *parentdn, struct backentry ***child_entries, struct backdn ***child_dns, int is_resurect_operation);
 static int modrdn_rename_entry_update_indexes(back_txn *ptxn, Slapi_PBlock *pb, struct ldbminfo *li, struct backentry *e, struct backentry **ec, Slapi_Mods *smods1, Slapi_Mods *smods2, Slapi_Mods *smods3, Slapi_Mods *smods4);
 static void mods_remove_nsuniqueid(Slapi_Mods *smods);
-static int32_t dsentrydn_modrdn_update(backend *be, const char *newdn, struct backentry *e, struct backentry **ec, back_txn *txn);
+static int32_t dsentrydn_modrdn_update(backend *be, const char *newdn, struct backentry *e, back_txn *txn);
 static int dsentrydn_moddn_rename(back_txn *ptxn, backend *be, ID id, IDList *children, const Slapi_DN *dn_parentdn, const Slapi_DN *dn_newsuperiordn, struct backentry *child_entries[]);
 
 #define MOD_SET_ERROR(rc, error, count)                                            \
@@ -1465,17 +1465,8 @@ common_return:
             ldap_result_code = LDAP_SUCCESS;
         }
         if (!result_sent) {
-            int deferred;
-
             if (!is_internal) {
-                slapi_pblock_get(pb, SLAPI_DEFERRED_MEMBEROF, &deferred);
-                if (deferred) {
-                    PRIntervalTime delay = PR_MillisecondsToInterval(100);
-                    while (deferred && !g_get_shutdown()) {
-                        DS_Sleep(delay);
-                        slapi_pblock_get(pb, SLAPI_DEFERRED_MEMBEROF, &deferred);
-                    }
-                }
+                slapi_pblock_wait_deferred_memberof(pb);
             }
             slapi_send_ldap_result(pb, ldap_result_code, ldap_result_matcheddn,
                                    ldap_result_message, 0, NULL);
@@ -1543,7 +1534,6 @@ dsentrydn_moddn_rename_child(
     Slapi_Backend *be,
     struct ldbminfo *li,
     struct backentry *e,
-    struct backentry **ec,
     size_t parentdncomps,
     char **newsuperiordns,
     size_t newsuperiordncomps)
@@ -1561,7 +1551,7 @@ dsentrydn_moddn_rename_child(
     int need = 1; /* For the '\0' */
     size_t i;
 
-    olddn = slapi_entry_attr_get_charptr((*ec)->ep_entry, SLAPI_ATTR_DS_ENTRYDN);
+    olddn = slapi_entry_attr_get_charptr(e->ep_entry, SLAPI_ATTR_DS_ENTRYDN);
     if (NULL == olddn) {
         return retval;
     }
@@ -1594,7 +1584,7 @@ dsentrydn_moddn_rename_child(
         }
     }
 
-    retval = dsentrydn_modrdn_update(be, newdn, e, ec, ptxn);
+    retval = dsentrydn_modrdn_update(be, newdn, e, ptxn);
 
 out:
     slapi_ch_free_string(&olddn);
@@ -1614,13 +1604,10 @@ dsentrydn_moddn_rename(
 {
     /* Iterate over the children list renaming every child */
     struct ldbminfo *li = (struct ldbminfo *)be->be_database->plg_private;
-    ldbm_instance *inst = (ldbm_instance *)be->be_instance_info;
-    struct backentry **child_entry_copies = NULL;
     int retval = 0;
     char **newsuperiordns = NULL;
     size_t newsuperiordncomps = 0;
     size_t parentdncomps = 0;
-    NIDS nids = children ? children->b_nids : 0;
 
     /*
      * Break down the parent entry dn into its components.
@@ -1650,29 +1637,12 @@ dsentrydn_moddn_rename(
     /*
      * Iterate over the child entries renaming them.
      */
-    child_entry_copies = (struct backentry **)slapi_ch_calloc(sizeof(struct backentry *), nids + 1);
-    for (size_t i = 0; i <= nids; i++) {
-        child_entry_copies[i] = backentry_dup(child_entries[i]);
-    }
     for (size_t i = 0; retval == 0 && child_entries[i]; i++) {
-        retval = dsentrydn_moddn_rename_child(ptxn, be, li, child_entries[i], &child_entry_copies[i],
+        retval = dsentrydn_moddn_rename_child(ptxn, be, li, child_entries[i],
                                               parentdncomps, newsuperiordns,
                                               newsuperiordncomps);
     }
 
-    if (0 == retval) {
-        for (size_t i = 0; child_entries[i]; i++) {
-            CACHE_REMOVE(&inst->inst_cache, child_entry_copies[i]);
-            CACHE_RETURN(&inst->inst_cache, &(child_entry_copies[i]));
-        }
-    } else {
-        /* failure */
-        for (size_t i = 0; child_entries[i]; i++) {
-            backentry_free(&(child_entry_copies[i]));
-        }
-    }
-
-    slapi_ch_free((void **)&child_entry_copies);
     slapi_ldap_value_free(newsuperiordns);
 
     return retval;
@@ -1683,17 +1653,18 @@ dsentrydn_modrdn_update(
     backend *be,
     const char *newdn,
     struct backentry *e,
-    struct backentry **ec,
     back_txn *txn)
 {
+    struct backentry *ec = NULL;
     int32_t ret = 0;
     int32_t cache_rc = 0;
     ldbm_instance *inst = (ldbm_instance *)be->be_instance_info;
 
     /* We have the entry, so update id2entry */
-    slapi_entry_attr_set_charptr((*ec)->ep_entry, SLAPI_ATTR_DS_ENTRYDN, newdn);
-    slapi_entry_set_dn((*ec)->ep_entry, (char *)newdn);
-    ret = id2entry_add_ext(be, *ec, txn, 1, &cache_rc);
+    ec = backentry_dup(e);
+    slapi_entry_attr_set_charptr(ec->ep_entry, SLAPI_ATTR_DS_ENTRYDN, newdn);
+    slapi_entry_set_dn(ec->ep_entry, (char *)newdn);
+    ret = id2entry_add_ext(be, ec, txn, 1, &cache_rc);
     if (cache_rc) {
         slapi_log_err(SLAPI_LOG_CACHE,
                       "dsentrydn_modrdn_update",
@@ -1713,15 +1684,21 @@ dsentrydn_modrdn_update(
         goto out;
     }
 
-    if (cache_replace(&inst->inst_cache, e, *ec) != 0) {
-        /* id2entry was updated, so update the cache */
+    if ((ret = cache_replace(&inst->inst_cache, e, ec)) == 0) {
+        CACHE_REMOVE(&inst->inst_cache, ec);
+        CACHE_RETURN(&inst->inst_cache, &ec);
+    } else {
         slapi_log_err(SLAPI_LOG_CACHE,
                       "dsentrydn_modrdn_update", "cache_replace %s -> %s failed\n",
-                      slapi_entry_get_dn(e->ep_entry), slapi_entry_get_dn((*ec)->ep_entry));
-        ret = -1;
+                      slapi_entry_get_dn(e->ep_entry),
+                      slapi_entry_get_dn(ec->ep_entry));
     }
 
 out:
+    if (ret) {
+        backentry_free(&ec);
+    }
+
     return ret;
 }
 

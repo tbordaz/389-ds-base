@@ -12,36 +12,35 @@ import pytest
 import ldap
 import logging
 import glob
-import random
 import re
-from contextlib import suppress
+import json
 from lib389.backend import Backend, Backends, DatabaseConfig
-from lib389.cli_base import FakeArgs
-from lib389.cli_ctl.dbgen import dbgen_create_groups
 from lib389.cli_ctl.dblib import DbscanHelper
 from lib389.config import LDBMConfig
 from lib389._constants import DEFAULT_BENAME, DEFAULT_SUFFIX, PW_DM, SER_ROOT_DN, SER_ROOT_PW
-from lib389.cos import  CosClassicDefinition, CosClassicDefinitions, CosTemplate
+from lib389.cos import CosClassicDefinition, CosTemplate
 from lib389.dbgen import dbgen_users
 from lib389.dirsrv_log import DirsrvErrorLog
 from lib389.idm.domain import Domain
-from lib389.idm.group import Groups, Group
+from lib389.idm.group import Groups
 from lib389.idm.nscontainer import nsContainer
+from lib389.idm.organizationalunit import OrganizationalUnits
 from lib389.idm.user import UserAccount, UserAccounts
-from lib389.index import Index, Indexes
+from lib389.index import Index
 from lib389._mapped_object import DSLdapObject, DSLdapObjects
 from lib389.plugins import MemberOfPlugin
 from lib389.properties import TASK_WAIT
 from lib389.tasks import Tasks, Task
 from test389.topologies import topology_st as topo
 from lib389.utils import ds_is_older
-from textwrap import dedent
 
 pytestmark = pytest.mark.tier1
 
 SUFFIX2 = 'dc=example2,dc=com'
 BENAME2 = 'be2'
 CN_INDEX_DN = f'cn=cn,cn=index,cn={DEFAULT_BENAME},cn=ldbm database,cn=plugins,cn=config'
+PARENTID_INDEX_DN = f'cn=parentid,cn=index,cn={DEFAULT_BENAME},cn=ldbm database,cn=plugins,cn=config'
+UID_INDEX_DN = f'cn=uid,cn=index,cn={DEFAULT_BENAME},cn=ldbm database,cn=plugins,cn=config'
 
 DEBUGGING = os.getenv("DEBUGGING", default=False)
 logging.getLogger(__name__).setLevel(logging.INFO)
@@ -546,6 +545,61 @@ def test_task_status(topo):
     assert reindex_task.get_exit_code() == 0
 
 
+def test_reindex_entrydn_only_is_noop(topo):
+    """Reindex of obsolete entrydn alone must not rebuild all indexes.
+
+    When entryrdn is in use, leftover entrydn index config is ignored. A
+    reindex task for only entrydn must warn, finish successfully, and not
+    fall through to a full attribute rebuild.
+
+    :id: e3bbda7a-82f0-409f-a926-d86835c56aaa
+    :setup: Standalone instance
+    :steps:
+        1. Add obsolete entrydn index configuration
+        2. Clear the error log and restart
+        3. Run an online reindex task for entrydn only
+        4. Check task exit code and log messages
+    :expectedresults:
+        1. Success
+        2. Success
+        3. Task completes with exit code 0
+        4. Log shows entrydn is no longer applicable / no applicable
+           indexes; no "Indexing attribute: cn" (full rebuild)
+    """
+    inst = topo.standalone
+    backend = Backends(inst).get(DEFAULT_BENAME)
+
+    log.info("Add obsolete entrydn index configuration")
+    backend.add_index("entrydn", ["eq"])
+    inst.restart()
+
+    log.info("Clear error log so assertions are limited to this reindex")
+    inst.deleteErrorLogs(restart=True)
+
+    log.info("Reindex entrydn only")
+    tasks = Tasks(inst)
+    tasks.reindex(
+        suffix=DEFAULT_SUFFIX,
+        attrname='entrydn',
+        args={TASK_WAIT: True}
+    )
+    reindex_task = Task(inst, tasks.dn)
+    assert reindex_task.get_exit_code() == 0
+    task_log = reindex_task.get_task_log() or ""
+    assert "no longer applicable" in task_log.lower() or \
+           "no applicable indexes" in task_log.lower(), \
+           f"Unexpected task log: {task_log}"
+
+    errlog = DirsrvErrorLog(inst)
+    assert errlog.match(".*no longer applicable") or errlog.match(".*No applicable indexes")
+    assert not errlog.match(".*Indexing attribute: cn"), \
+        "entrydn-only reindex must not fall through to a full index rebuild"
+
+    log.info("Remove obsolete entrydn index configuration")
+    Index(inst, f"cn=entrydn,cn=index,cn={DEFAULT_BENAME},cn=ldbm database,cn=plugins,cn=config").delete()
+    inst.restart()
+
+
 def count_keys(inst, bename, attr, prefix=''):
     indexfile = os.path.join(inst.dbdir, bename, attr + '.db')
     # (bdb - we should also accept a version number for .db suffix)
@@ -1007,6 +1061,13 @@ def test_concurrent_modifications_during_indexing(topo, homeDirectory_index_clea
     else:
         log.info("Indexing completed too quickly to observe UNWILLING_TO_PERFORM")
 
+    # On slow machines the reindex can outlive the monitoring loop; the final
+    # modifications below are only expected to succeed once it is done.
+    log.info("Waiting for the indexing task to complete")
+    reindex_task.wait(timeout=600)
+    exit_code = reindex_task.get_exit_code()
+    assert exit_code == 0, f"Reindex task failed or timed out: {exit_code}"
+
     test_users[0].replace('sn', 'final_test')
     assert test_users[0].get_attr_val_utf8('sn') == 'final_test'
 
@@ -1053,6 +1114,10 @@ def homeDirectory_setup(request, topo, homeDirectory_index_cleanup):
     return user_list, index
 
 
+MIXED_VALUE = "/home/mYhOmEdIrEcToRy"
+LOWER_VALUE = "/home/myhomedirectory"
+
+
 def setup_matching_rule(topo, index):
     index.replace('nsMatchingRule',
                   ['caseIgnoreIA5Match', 'caseExactIA5Match'])
@@ -1065,6 +1130,25 @@ def setup_matching_rule(topo, index):
         attrname='homeDirectory',
         args={TASK_WAIT: True}
     ) == 0
+
+
+def _reindex_homedirectory(inst):
+    """Run a blocking reindex task for homeDirectory on the default suffix."""
+    tasks = Tasks(inst)
+    assert (
+        tasks.reindex(
+            suffix=DEFAULT_SUFFIX,
+            attrname="homeDirectory",
+            args={TASK_WAIT: True},
+        )
+        == 0
+    )
+
+
+def _assert_homedirectory_errlog_clean(inst):
+    """Assert reindex did not log an unknown or invalid matching rule."""
+    errlog = DirsrvErrorLog(inst)
+    assert not errlog.match("unknown or invalid matching rule")
 
 
 def test_reindex_homedirectory_matching_rules(topo, homeDirectory_setup):
@@ -1089,7 +1173,7 @@ def test_reindex_homedirectory_matching_rules(topo, homeDirectory_setup):
         3. Assertion holds (no match found)
     """
 
-    user_list, index = homeDirectory_setup
+    _, index = homeDirectory_setup
 
     log.info("Remove existing error logs so the scan is limited to reindex/matching-rule output")
     topo.standalone.deleteErrorLogs(restart=True)
@@ -1097,8 +1181,7 @@ def test_reindex_homedirectory_matching_rules(topo, homeDirectory_setup):
     setup_matching_rule(topo, index)
 
     log.info("Scan error log for bad matching rule")
-    errlog = DirsrvErrorLog(topo.standalone)
-    assert not errlog.match("unknown or invalid matching rule")
+    _assert_homedirectory_errlog_clean(topo.standalone)
 
 
 def test_reindex_homedirectory_mixed_value(topo, homeDirectory_setup):
@@ -1128,10 +1211,6 @@ def test_reindex_homedirectory_mixed_value(topo, homeDirectory_setup):
         5. No entry found
         6. One entry found
     """
-
-    MIXED_VALUE = "/home/mYhOmEdIrEcToRy"
-    LOWER_VALUE = "/home/myhomedirectory"
-
     user_list, index = homeDirectory_setup
     setup_matching_rule(topo, index)
 
@@ -1139,34 +1218,103 @@ def test_reindex_homedirectory_mixed_value(topo, homeDirectory_setup):
     log.info("Replace homeDirectory with mixed-case value")
     target.replace('homeDirectory', MIXED_VALUE)
 
-
-    inst = topo.standalone
+    users = UserAccounts(topo.standalone, DEFAULT_SUFFIX)
 
     log.info("Search with plain eq search")
-    r = inst.search_s(target.dn, ldap.SCOPE_BASE, f"(homeDirectory={MIXED_VALUE})")
+    r = users.filter(f"(homeDirectory={MIXED_VALUE})")
     assert len(r) == 1
 
     log.info("Search with caseExactIA5Match")
-    r = inst.search_s(
-        target.dn, ldap.SCOPE_BASE, f"(homeDirectory:caseExactIA5Match:={MIXED_VALUE})"
-    )
+    r = users.filter(f"(homeDirectory:caseExactIA5Match:={MIXED_VALUE})")
     assert len(r) == 1
 
     log.info("Search with lower-case value")
-    r = inst.search_s(target.dn, ldap.SCOPE_BASE, f"(homeDirectory={LOWER_VALUE})")
+    r = users.filter(f"(homeDirectory={LOWER_VALUE})")
     assert len(r) == 0
 
     log.info("Search with caseExactIA5Match and lower-case value")
-    r = inst.search_s(
-        target.dn, ldap.SCOPE_BASE, f"(homeDirectory:caseExactIA5Match:={LOWER_VALUE})"
-    )
+    r = users.filter(f"(homeDirectory:caseExactIA5Match:={LOWER_VALUE})")
     assert len(r) == 0
 
     log.info("Search with caseIgnoreIA5Match and lower-case value")
-    r = inst.search_s(
-        target.dn, ldap.SCOPE_BASE, f"(homeDirectory:caseIgnoreIA5Match:={LOWER_VALUE})"
-    )
+    r = users.filter(f"(homeDirectory:caseIgnoreIA5Match:={LOWER_VALUE})")
     assert len(r) == 1
+
+    log.info("Subtree search with exact stored homeDirectory value")
+    r = users.filter(f"(homeDirectory={MIXED_VALUE})")
+    assert len(r) == 1
+
+    log.info("Subtree search with caseExactIA5Match and exact stored value")
+    r = users.filter(f"(homeDirectory:caseExactIA5Match:={MIXED_VALUE})")
+    assert len(r) == 1
+
+    log.info("Subtree search with lower-case value does not match default eq")
+    r = users.filter(f"(homeDirectory={LOWER_VALUE})")
+    assert len(r) == 0
+
+    log.info("Subtree search with caseExactIA5Match and lower-case value")
+    r = users.filter(f"(homeDirectory:caseExactIA5Match:={LOWER_VALUE})")
+    assert len(r) == 0
+
+    log.info("Subtree search with caseIgnoreIA5Match and lower-case value")
+    r = users.filter(f"(homeDirectory:caseIgnoreIA5Match:={LOWER_VALUE})")
+    assert len(r) == 1
+
+
+def test_homedirectory_caseexactia5_reindex_after_dual_ia5(topo, homeDirectory_setup):
+    """homeDirectory caseExactIA5Match reindex after dual IA5 index (ticket 48746).
+
+    Covers the full ticket 48746 sequence on one index instance: index with
+    caseIgnoreIA5Match and caseExactIA5Match, reindex, set a mixed-case value,
+    base-scope extensible filter search, then replace matching rules with
+    caseExactIA5Match only and reindex without crash or invalid-MR errors.
+
+    :id: 17636675-0273-42cd-afdc-1511cf3a1d7e
+    :setup: Standalone instance, homeDirectory_setup fixture
+    :steps:
+        1. Set nsMatchingRule to caseIgnoreIA5Match and caseExactIA5Match, reindex
+        2. Verify the error log has no unknown or invalid matching rule
+        3. Set a mixed-case homeDirectory on new_account1
+        4. Base-scope search with (homeDirectory:caseExactIA5Match:=<mixed>)
+        5. Set nsMatchingRule to caseExactIA5Match only, reindex
+        6. Verify the error log is still clean
+    :expectedresults:
+        1. Reindex succeeds
+        2. No invalid matching-rule message in the error log
+        3. Success
+        4. One entry is returned (server stays up)
+        5. Reindex succeeds
+        6. No invalid matching-rule message in the error log
+    """
+    user_list, index = homeDirectory_setup
+    inst = topo.standalone
+    target = user_list[1]
+
+    inst.deleteErrorLogs(restart=True)
+
+    log.info("Index homeDirectory with caseIgnoreIA5Match and caseExactIA5Match")
+    setup_matching_rule(topo, index)
+    _assert_homedirectory_errlog_clean(inst)
+
+    log.info("Set mixed-case homeDirectory on new_account1")
+    target.replace("homeDirectory", MIXED_VALUE)
+
+    log.info(
+        "Base-scope caseExactIA5Match search with exact stored value "
+        "(loads filter MR before CES-only reindex)"
+    )
+    results = target.search(
+        scope="base",
+        filter=f"(homeDirectory:caseExactIA5Match:={MIXED_VALUE})",
+    )
+    assert len(results) == 1
+    assert results[0].dn.lower() == target.dn.lower()
+
+    log.info("Reindex homeDirectory with caseExactIA5Match only")
+    index.replace("nsMatchingRule", ["caseExactIA5Match"])
+    inst.restart()
+    _reindex_homedirectory(inst)
+    _assert_homedirectory_errlog_clean(inst)
 
 
 def test_idl_range_limit(topo, add_some_entries):
@@ -1252,6 +1400,320 @@ def test_large_multivalued_sn_attribute(topo):
     # Clean up
     user.delete()
     log.info("User entry deleted successfully")
+
+
+def test_nsmatchingrule_vs_schema(topo):
+    """Check that parentid uses an integer matching rule
+
+    parentid is defined in schema with EQUALITY integerMatch and no ORDERING
+    rule. The system index configures nsMatchingRule: integerOrderingMatch so
+    range/order comparisons still use integer semantics even if the syntax
+    of parentid selects a lexicographic matching rule.
+
+    :id: 419bd59c-3bec-4e94-9bc5-9043e36787ac
+    :setup: Standalone instance
+    :steps:
+        1. Query the parentid attribute type from the schema
+        2. Read nsMatchingRule from the parentid index entry
+        3. Create 10 OUs under the suffix and one user under each OU
+        4. Stop the instance, run dbscan on parentid, and collect equality keys
+        5. Override parentid in 99user.ldif with EQUALITY caseIgnoreMatch
+        6. Clear the error logs, start the instance, and verify the schema override
+           and the INFO message about using the configured matching rule
+        7. Create 10 more OUs/users and verify dbscan keys remain in integer order
+    :expectedresults:
+        1. Schema has integer syntax and no ORDERING rule
+        2. Index nsMatchingRule contains integerOrderingMatch
+        3. Entries are created successfully
+        4. Equality keys are present and sorted numerically
+        5. 99user.ldif is written successfully
+        6. Schema uses string syntax with no ORDERING, and the error log contains
+           the configured matching rule compatibility message
+        7. Keys remain sorted numerically (nsMatchingRule wins over schema)
+    """
+    inst = topo.standalone
+    created_ous = []
+    created_users = []
+    schema_filename = os.path.join(inst.schemadir, '99user.ldif')
+    schema_backup = None
+    integer_syntax = '1.3.6.1.4.1.1466.115.121.1.27'
+    string_syntax = '1.3.6.1.4.1.1466.115.121.1.15'
+    expected_log_msg = (
+        'The attribute [parentid] does not have a valid ORDERING matching rule using integerOrderingMatch'
+    )
+
+    def _parentid_equality_keys():
+        output = inst.dbscan(bename=DEFAULT_BENAME, index='parentid',
+                             stopping=False).decode()
+        keys = []
+        for line in output.splitlines():
+            line = line.strip()
+            match = re.match(r'^(?:KEY:\s*)?=(\d+)\s*$', line)
+            if match:
+                keys.append(int(match.group(1)))
+        return keys
+
+    def _assert_integer_ordered(keys):
+        log.info("parentid equality keys from dbscan: %s", keys)
+        assert len(keys) >= 2, f"Expected at least 2 parentid equality keys, got {keys}"
+        assert any(k >= 10 for k in keys), (
+            f"Expected a multi-digit parentid key to distinguish integer vs "
+            f"lexicographic order, got {keys}"
+        )
+        integer_sorted = sorted(keys)
+        lex_sorted = sorted(keys, key=str)
+        assert keys == integer_sorted, (
+            f"parentid equality keys are not in integer order: {keys}"
+        )
+        assert integer_sorted != lex_sorted, (
+            f"Test data did not produce differing integer/lex orders: {keys}"
+        )
+
+    log.info("Check parentid schema is integer syntax but no ordering matching rule")
+    attr_result = inst.schema.query_attributetype('parentid', json=True)
+    assert attr_result is not None
+    attr_result_json = json.loads(attr_result) if isinstance(attr_result, str) else attr_result
+    assert attr_result_json['at']['syntax'] == integer_syntax, (
+        f"Expected parentid is syntax integer in the schema, got {attr_result_json['at']['syntax']}"
+    )
+    assert attr_result_json['at']['ordering'] == None, (
+        f"Expected parentid ORDERING is not defined in the schema, got {attr_result_json['at']['ordering']}"
+    )
+    log.info("parentid schema ORDERING not defined, so it uses integer syntax for ordering")
+
+    log.info("Check parentid index nsMatchingRule")
+    parentid_index = Index(inst, PARENTID_INDEX_DN)
+    matching_rules = [mr.lower() for mr in parentid_index.get_attr_vals_utf8('nsMatchingRule')]
+    assert 'integerorderingmatch' in matching_rules, (
+        f"Expected integerOrderingMatch in parentid nsMatchingRule, got {matching_rules}"
+    )
+    log.info("parentid index nsMatchingRule includes integerOrderingMatch")
+
+    try:
+        # Create 10 OUs and one user under each so parentid equality keys
+        # include distinct parent entry IDs (including values >= 10, where
+        # lexicographic and integer ordering diverge).
+        log.info("Create 10 OUs with one user under each")
+        ous = OrganizationalUnits(inst, DEFAULT_SUFFIX)
+        for i in range(10):
+            ou = ous.create(properties={'ou': f'parentid-mr-test-{i}'})
+            created_ous.append(ou)
+            users = UserAccounts(inst, ou.dn, rdn=None)
+            user = users.create(properties={
+                'uid': f'parentid_user_{i}',
+                'cn': f'parentid_user_{i}',
+                'sn': f'parentid_user_{i}',
+                'uidNumber': f'{1000 + i}',
+                'gidNumber': f'{1000 + i}',
+                'homeDirectory': f'/home/parentid_user_{i}'
+            })
+            created_users.append(user)
+
+        log.info("Stop instance, scan parentid index, and override schema")
+        inst.stop()
+        keys = _parentid_equality_keys()
+        _assert_integer_ordered(keys)
+        log.info("parentid equality keys are sorted with integer ordering")
+
+        if os.path.exists(schema_filename):
+            with open(schema_filename, 'r') as schema_file:
+                schema_backup = schema_file.read()
+
+        log.info("Write parentid schema override to %s", schema_filename)
+        with open(schema_filename, 'w') as schema_file:
+            schema_file.write("dn: cn=schema\n")
+            schema_file.write(
+                "attributetypes: ( 2.16.840.1.113730.3.1.604 NAME 'parentid' "
+                "DESC 'internal server defined attribute type' "
+                "EQUALITY caseIgnoreMatch "
+                "SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE "
+                "NO-USER-MODIFICATION USAGE directoryOperation "
+                "X-ORIGIN 'user defined' )\n"
+            )
+        os.chmod(schema_filename, 0o644)
+
+        log.info("Clear error logs before restart so we only see post-override messages")
+        inst.deleteErrorLogs(restart=False)
+        inst.start()
+
+        log.info("Check error log for configured matching-rule fallback message")
+        errlog = DirsrvErrorLog(inst)
+        matches = errlog.match(f'.*{re.escape(expected_log_msg)}.*')
+        assert matches, (
+            f'Expected error log message containing: {expected_log_msg}'
+        )
+        log.info("Found expected matching-rule compatibility message in error log")
+
+        log.info("Check parentid schema is string syntax but no ordering matching rule")
+        attr_result = inst.schema.query_attributetype('parentid', json=True)
+        attr_result_json = json.loads(attr_result) if isinstance(attr_result, str) else attr_result
+        assert attr_result_json['at']['syntax'] == string_syntax, (
+            f"Expected parentid is syntax string in the schema, got {attr_result_json['at']['syntax']}"
+        )
+        assert attr_result_json['at']['ordering'] == None, (
+        f"Expected parentid ORDERING is not defined after 99user.ldif override, got {attr_result_json['at']['ordering']}"
+        )
+        log.info("parentid schema ORDERING not defined")
+
+        log.info("Create 10 more OUs with one user under each after schema override")
+        ous = OrganizationalUnits(inst, DEFAULT_SUFFIX)
+        for i in range(10, 20):
+            ou = ous.create(properties={'ou': f'parentid-mr-test-{i}'})
+            created_ous.append(ou)
+            users = UserAccounts(inst, ou.dn, rdn=None)
+            user = users.create(properties={
+                'uid': f'parentid_user_{i}',
+                'cn': f'parentid_user_{i}',
+                'sn': f'parentid_user_{i}',
+                'uidNumber': f'{1000 + i}',
+                'gidNumber': f'{1000 + i}',
+                'homeDirectory': f'/home/parentid_user_{i}'
+            })
+            created_users.append(user)
+
+        inst.stop()
+        try:
+            keys = _parentid_equality_keys()
+            _assert_integer_ordered(keys)
+        finally:
+            inst.start()
+        log.info("parentid equality keys remain integer-ordered after schema override")
+    finally:
+        if not inst.status():
+            inst.start()
+        for user in reversed(created_users):
+            try:
+                user.delete()
+            except ldap.NO_SUCH_OBJECT:
+                pass
+        for ou in reversed(created_ous):
+            try:
+                ou.delete()
+            except ldap.NO_SUCH_OBJECT:
+                pass
+        # Restore original 99user.ldif so later tests are not affected
+        if schema_backup is not None:
+            with open(schema_filename, 'w') as schema_file:
+                schema_file.write(schema_backup)
+            inst.restart()
+        elif os.path.exists(schema_filename):
+            try:
+                with open(schema_filename, 'r') as schema_file:
+                    content = schema_file.read()
+                if "NAME 'parentid'" in content and "caseIgnoreMatch" in content:
+                    os.remove(schema_filename)
+                    inst.restart()
+            except OSError:
+                pass
+
+
+def test_index_check_detects_mismatch(topo):
+    """Check that index-check reports uid ordering mismatch when
+       integerOrderingMatch is configured but disk is lexicographic
+
+    :id: 6771055e-423d-4e84-827e-c119e6d9e560
+    :setup: Standalone instance
+    :steps:
+        1. Create a dedicated OU for the test users
+        2. Create 100 users with uid 1 through 100
+        3. Search for the users and verify the count
+        4. Add integerOrderingMatch to the uid index configuration
+        5. Run index-check and verify uid ordering mismatch is reported
+        6. Delete the created users and OU and restore the uid index
+    :expectedresults:
+        1. OU is created successfully
+        2. All users are created successfully
+        3. Exactly 100 users are found
+        4. uid index nsMatchingRule contains integerOrderingMatch
+        5. index-check output contains the uid lexicographic mismatch message
+        6. Users and OU are deleted successfully and uid index is restored
+    """
+    inst = topo.standalone
+    ous = OrganizationalUnits(inst, DEFAULT_SUFFIX)
+    ou = None
+    created_users = []
+    uid_index = Index(inst, UID_INDEX_DN)
+    original_matching_rules = uid_index.get_attr_vals_utf8('nsMatchingRule') or []
+
+    try:
+        ou = ous.create(properties={'ou': 'uid-range-test'})
+        users_api = UserAccounts(inst, ou.dn, rdn=None)
+
+        log.info("Create 100 users with uid from 1 to 100")
+        for i in range(1, 101):
+            uid = str(i)
+            user = users_api.create(properties={
+                'uid': uid,
+                'cn': f'user {uid}',
+                'sn': f'user {uid}',
+                'uidNumber': str(1000 + i),
+                'gidNumber': str(1000 + i),
+                'homeDirectory': f'/home/{uid}',
+            })
+            created_users.append(user)
+
+        log.info("Verify all 100 users exist")
+        results = inst.search_s(
+            ou.dn,
+            ldap.SCOPE_ONELEVEL,
+            '(objectclass=inetOrgPerson)',
+        )
+        assert len(results) == 100
+        log.info("Found all 100 users with uid 1-100")
+
+        log.info("Add integerOrderingMatch to uid index %s", UID_INDEX_DN)
+        matching_rules = list(original_matching_rules)
+        if 'integerOrderingMatch' not in [mr.lower() for mr in matching_rules]:
+            matching_rules.append('integerOrderingMatch')
+        uid_index.replace('nsMatchingRule', matching_rules)
+        inst.restart()
+
+        matching_rules = [mr.lower() for mr in uid_index.get_attr_vals_utf8('nsMatchingRule')]
+        assert 'integerorderingmatch' in matching_rules, (
+            f"Expected integerOrderingMatch in uid nsMatchingRule, got {matching_rules}"
+        )
+        log.info("uid index nsMatchingRule includes integerOrderingMatch")
+
+        from lib389.cli_base import FakeArgs
+        from lib389.cli_ctl.dbtasks import dbtasks_index_check
+
+        expected_index_check_msg = (
+            "MISMATCH: config has integerOrderingMatch but disk is "
+            "lexicographic (suggest redindex)"
+        )
+
+        log.info("Stop instance and run index-check")
+        inst.stop()
+        inst.lint_clear_dse_cache()
+        topo.logcap.flush()
+        args = FakeArgs()
+        args.backend = DEFAULT_BENAME
+        args.fix = False
+        dbtasks_index_check(inst, topo.logcap.log, args)
+        assert topo.logcap.contains(expected_index_check_msg), (
+            f"Expected index-check output to contain: {expected_index_check_msg}"
+        )
+        topo.logcap.flush()
+        log.info("index-check reported uid ordering mismatch as expected")
+
+    finally:
+        if not inst.status():
+            inst.start()
+        for user in reversed(created_users):
+            try:
+                user.delete()
+            except ldap.NO_SUCH_OBJECT:
+                pass
+        if ou is not None:
+            try:
+                ou.delete()
+            except ldap.NO_SUCH_OBJECT:
+                pass
+        if original_matching_rules:
+            uid_index.replace('nsMatchingRule', original_matching_rules)
+        else:
+            uid_index.remove_all('nsMatchingRule')
+        inst.restart()
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import {
     ValidatedOptions,
 } from "@patternfly/react-core";
 import { log_cmd, valid_port, valid_dn, getApiErrorMessage } from "../tools.jsx";
+import { DsNumberInput } from "../dsNumberInput.jsx";
 import PropTypes from "prop-types";
 
 const _ = cockpit.gettext;
@@ -28,7 +29,7 @@ export class SuffixReferrals extends React.Component {
             removeRef: "",
             refProtocol: "ldap://",
             refHost: "",
-            refPort: "",
+            refPort: "389",
             refSuffix: "",
             refFilter: "",
             refScope: "sub",
@@ -81,7 +82,8 @@ export class SuffixReferrals extends React.Component {
         this.setState({
             showRefModal: true,
             errObj: {},
-            refValue: ""
+            refValue: "",
+            refPort: "389",
         });
     }
 
@@ -110,7 +112,7 @@ export class SuffixReferrals extends React.Component {
         ];
         log_cmd("deleteRef", "Delete suffix referral", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     this.props.reload(this.props.suffix);
                     this.props.addNotification(
@@ -149,7 +151,7 @@ export class SuffixReferrals extends React.Component {
         ];
         log_cmd("saveRef", "Add referral", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     this.props.reload(this.props.suffix);
                     this.closeRefModal();
@@ -257,13 +259,17 @@ export class SuffixReferrals extends React.Component {
 
     render() {
         return (
-            <div className="ds-sub-header ds-margin-bottom-md">
+            <div className="ds-sub-header ds-left-margin ds-margin-bottom-md">
                 <ReferralTable
                     key={this.props.rows}
                     rows={this.props.rows}
                     deleteRef={this.showConfirmRefDelete}
                 />
-                <Button variant="primary" onClick={this.handleShowRefModal}>
+                <Button
+                    variant="primary"
+                    onClick={this.handleShowRefModal}
+                    className="ds-margin-top"
+                >
                     {_("Create Referral")}
                 </Button>
                 <DoubleConfirmModal
@@ -289,6 +295,7 @@ export class SuffixReferrals extends React.Component {
                     previewValue={this.state.refValue}
                     refProtocol={this.state.refProtocol}
                     refScope={this.state.refScope}
+                    refPort={this.state.refPort}
                     error={this.state.errObj}
                     saving={this.state.saving}
                     saveBtnDisabled={this.state.saveBtnDisabled}
@@ -313,6 +320,7 @@ class AddReferralModal extends React.Component {
             saveBtnDisabled,
             refProtocol,
             refScope,
+            refPort,
         } = this.props;
 
         if (previewValue === "") {
@@ -381,15 +389,15 @@ class AddReferralModal extends React.Component {
                             {_("Port Number")}
                         </GridItem>
                         <GridItem span={9}>
-                            <TextInput
-                                type="number"
+                            <DsNumberInput
                                 id="refPort"
-                                aria-describedby="horizontal-form-name-helper"
-                                name="refPort"
-                                onChange={(e, checked) => {
+                                value={refPort}
+                                min={1}
+                                max={65535}
+                                validated={error.refPort ? ValidatedOptions.error : ValidatedOptions.default}
+                                onChange={(e) => {
                                     handleChange(e);
                                 }}
-                                validated={error.refPort ? ValidatedOptions.error : ValidatedOptions.default}
                             />
                         </GridItem>
                     </Grid>

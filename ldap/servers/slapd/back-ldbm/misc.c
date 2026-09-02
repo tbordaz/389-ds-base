@@ -57,6 +57,24 @@ ldbm_nasty(const char *func, const char *str, int c, int err)
     }
 }
 
+/* Backoff before retrying a DBI_RC_RETRY fetch: exponential with jitter,
+ * capped at 200ms */
+void
+ldbm_fetch_retry_sleep(int retry_count)
+{
+    PRUint32 backoff_ms = 10;
+    int i;
+
+    for (i = 0; i < retry_count && backoff_ms < 200; i++) {
+        backoff_ms *= 2;
+    }
+    if (backoff_ms > 200) {
+        backoff_ms = 200;
+    }
+    backoff_ms += slapi_rand() % (backoff_ms + 1);
+    DS_Sleep(PR_MillisecondsToInterval(backoff_ms));
+}
+
 /* Put a message in the access log, complete with connection ID and operation ID */
 void
 ldbm_log_access_message(Slapi_PBlock *pblock, char *string)
@@ -106,9 +124,19 @@ static const char *systemIndexes[] = {
 
 
 int
+ldbm_index_entrydn_should_ignore(const char *index_name)
+{
+    /* entryrdn is always enabled; leftover entrydn indexes must be ignored */
+    return index_name && (0 == strcasecmp(index_name, LDBM_ENTRYDN_STR));
+}
+
+int
 ldbm_attribute_always_indexed(const char *attrtype)
 {
     int r = 0;
+    if (ldbm_index_entrydn_should_ignore(attrtype)) {
+        return 0;
+    }
     if (NULL != attrtype) {
         int i = 0;
         while (!r && systemIndexes[i] != NULL) {

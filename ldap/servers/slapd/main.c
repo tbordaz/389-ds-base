@@ -52,6 +52,9 @@ union semun
 #endif
 #include "slap.h"
 #include "slapi-plugin.h"
+#ifdef ENABLE_HIBP
+#include "hibp.h"
+#endif
 #include "prinit.h"
 #include "snmp_collator.h"
 #include "fe.h" /* client_auth_init() */
@@ -812,6 +815,9 @@ main(int argc, char **argv)
         goto cleanup;
     }
 
+    /* Initialize the logs maintenance thread */
+    logs_maintenance_init();
+
     /*
      * if we were called upon to do special database stuff, do it and be
      * done.
@@ -1035,6 +1041,13 @@ main(int argc, char **argv)
     pw_exp_init();
     op_stat_init();
 
+#ifdef ENABLE_HIBP
+    /* Initialise breached password checking. */
+    if (hibp_init() != 0) {
+        slapi_log_err(SLAPI_LOG_WARNING, "main", "Failed to initialise breached password checks\n");
+    }
+#endif
+
     plugin_print_lists();
     plugin_startall(argc, argv, NULL /* specific plugin list */);
     compute_plugins_started();
@@ -1079,6 +1092,7 @@ main(int argc, char **argv)
 
     /* pw_init() needs to be here since it uses aci function calls.  */
     pw_init();
+
     /* Initialize the sasl mapping code */
     if (sasl_map_init()) {
         slapi_log_err(SLAPI_LOG_CRIT, "main", "Failed to initialize sasl mapping code\n");

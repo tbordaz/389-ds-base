@@ -1098,7 +1098,6 @@ index_read_ext_allids(
     }
     for (retry_count = 0; retry_count < IDL_FETCH_RETRY_COUNT; retry_count++) {
         *err = NEW_IDL_DEFAULT;
-        PRIntervalTime interval;
         idl_free(&idl);
         idl = idl_fetch_ext(be, db, &key, db_txn, ai, err, allidslimit);
         if (*err == DBI_RC_RETRY) {
@@ -1106,23 +1105,13 @@ index_read_ext_allids(
             slapi_log_err(SLAPI_LOG_BACKLDBM, "index_read_ext_allids",
                           "DBI_RC_RETRY on retry %d/%d for %s\n",
                           retry_count + 1, IDL_FETCH_RETRY_COUNT, basetype);
-#ifdef FIX_TXN_DEADLOCKS
-#error can only retry here if txn == NULL - otherwise, have to abort and retry txn
-#endif
-            /* Exponential backoff with jitter, capped at 200ms */
-            {
-                PRUint32 backoff_ms = 10;
-                int i;
-                for (i = 0; i < retry_count && backoff_ms < 200; i++) {
-                    backoff_ms *= 2;
-                }
-                if (backoff_ms > 200) {
-                    backoff_ms = 200;
-                }
-                backoff_ms += slapi_rand() % (backoff_ms + 1);
-                interval = PR_MillisecondsToInterval(backoff_ms);
+            if (NULL != db_txn) {
+                /* Only the caller can retry its own transaction */
+                break;
             }
-            DS_Sleep(interval);
+            if (retry_count + 1 < IDL_FETCH_RETRY_COUNT) {
+                ldbm_fetch_retry_sleep(retry_count);
+            }
             continue;
         } else if (*err == DBI_RC_NOTFOUND) {
             /* Key not found in index - this is normal, not an error */
@@ -1140,9 +1129,14 @@ index_read_ext_allids(
             break;
         }
     }
-    if (retry_count == IDL_FETCH_RETRY_COUNT) {
-        ldbm_nasty("index_read_ext_allids", "index_read retry count exceeded", 1046, *err);
-        /* Ensure we don't return NULL after exhausting retries */
+    if (*err == DBI_RC_RETRY) {
+        if (NULL == db_txn && retry_count == IDL_FETCH_RETRY_COUNT) {
+            slapi_log_err(SLAPI_LOG_ERR, "index_read_ext_allids",
+                          "Index read on %s gave up after %d attempts due to "
+                          "transient lock conflicts. Error is %d\n",
+                          basetype, IDL_FETCH_RETRY_COUNT, *err);
+        }
+        /* Never return NULL on a transient failure */
         if (idl == NULL) {
             idl = idl_alloc(0);
         }
@@ -1254,11 +1248,28 @@ retry:
     ret = dblayer_cursor_op(&cursor, DBI_OP_MOVE_TO_KEY, key, &data); /* both key and data could be allocated */
     /* data allocated here, we don't need it */
     dblayer_value_free(be, &data);
-    if (DBI_RC_NOTFOUND == ret) {
+    if (DBI_RC_NOTFOUND == ret && key->size > 0) {
         /* If this happens, it means that we tried to seek to a key which has just been deleted */
-        /* So, we seek to the nearest one instead */
+        /* So, we seek to the nearest one instead; the seek rewrites the
+         * key, so keep a copy to tell whether we landed on it or past it */
+        dbi_val_t sought = {0};
+        char *keydup = slapi_ch_malloc(key->size);
+        memcpy(keydup, key->data, key->size);
+        dblayer_value_set(be, &sought, keydup, key->size);
         ret = dblayer_cursor_op(&cursor, DBI_OP_MOVE_NEAR_KEY, key, &data); /* both key and data could be allocated */
         /* a new key and data are allocated here, need to free them both */
+        dblayer_value_free(be, &data);
+        if (DBI_RC_SUCCESS == ret && !KEY_EQ(key, &sought)) {
+            /* The nearest key is already past the sought one: return it
+             * as the next key */
+            dblayer_value_free(be, &sought);
+            goto error;
+        }
+        dblayer_value_free(be, &sought);
+    } else if (DBI_RC_NOTFOUND == ret) {
+        /* Empty sought key from the old idl walk: keep its legacy
+         * land-on-first-then-advance behavior */
+        ret = dblayer_cursor_op(&cursor, DBI_OP_MOVE_NEAR_KEY, key, &data); /* both key and data could be allocated */
         dblayer_value_free(be, &data);
     }
     if (0 != ret) {
@@ -1681,8 +1692,20 @@ index_range_read_ext(
     dblayer_value_init(be, &lowerkey);   /* Clear lowerkey to avoid double free */
     *err = 0;
     if (coreop == SLAPI_OP_GREATER) {
-        *err = index_range_next_key(be, db, &cur_key, db_txn);
-        if (*err) {
+        /* The seek rewrote cur_key with the landed key: rebuild the
+         * bound and step off it only if the walk landed exactly on it */
+        dbi_val_t bound = {0};
+        set_range_limit(be, val, prefix, plen, &bound);
+        if (KEY_EQ(&cur_key, &bound)) {
+            *err = index_range_next_key(be, db, &cur_key, db_txn);
+        }
+        dblayer_value_free(be, &bound);
+        if (DBI_RC_NOTFOUND == *err) {
+            /* the bound key is the last key: the range is empty */
+            *err = 0;
+            idl = idl_alloc(0);
+            goto error;
+        } else if (*err) {
             slapi_log_err(SLAPI_LOG_ERR, "index_range_read_ext",
                           "(%s,%s) op==GREATER, no next key: %i)\n",
                           type, prefix, *err);
@@ -1694,20 +1717,53 @@ index_range_read_ext(
     }
 
     if (idl_get_idl_new()) { /* new idl */
-        /*
-         * li->li_flags is not set when doing internal search (as in bulk import)
-         * and since idl_new_range_fetch is broken for lmdb (because of bulk read operations)
-         * better use idl_lmdb_range_fetch in that case (which work on bdb but may be a
-         * bit slower)
-         */
-        if ((li->li_flags & (LI_LMDB_IMPL|LI_BDB_IMPL)) == LI_BDB_IMPL) {
-            idl = idl_new_range_fetch(be, db, &cur_key, &upperkey, db_txn,
-                                      ai, err, allidslimit, sizelimit, &expire_time,
-                                      lookthrough_limit, operator);
-        } else {
-            idl = idl_lmdb_range_fetch(be, db, &cur_key, &upperkey, db_txn,
-                                      ai, err, allidslimit, sizelimit, &expire_time,
-                                      lookthrough_limit, operator);
+        int retry_count = 0;
+        int idl_flags = *err; /* *err carries NEW_IDL_* input flags (e.g. NEW_IDL_NO_ALLID) */
+
+        /* A transient lock conflict (DBI_RC_RETRY) aborts the whole walk.
+         * Retrying is safe: the fetchers leave the caller's cur_key intact
+         * on failure and their internal read txn is already aborted. */
+        for (retry_count = 0; retry_count < IDL_FETCH_RETRY_COUNT; retry_count++) {
+            if (retry_count > 0) {
+                /* Drop partial results, restore the input flags */
+                idl_free(&idl);
+                *err = idl_flags;
+            }
+            /*
+             * li->li_flags is not set when doing internal search (as in bulk import)
+             * and since idl_new_range_fetch is broken for lmdb (because of bulk read operations)
+             * better use idl_lmdb_range_fetch in that case (which work on bdb but may be a
+             * bit slower)
+             */
+            if ((li->li_flags & (LI_LMDB_IMPL|LI_BDB_IMPL)) == LI_BDB_IMPL) {
+                idl = idl_new_range_fetch(be, db, &cur_key, &upperkey, db_txn,
+                                          ai, err, allidslimit, sizelimit, &expire_time,
+                                          lookthrough_limit, operator);
+            } else {
+                idl = idl_lmdb_range_fetch(be, db, &cur_key, &upperkey, db_txn,
+                                          ai, err, allidslimit, sizelimit, &expire_time,
+                                          lookthrough_limit, operator);
+            }
+            if (*err != DBI_RC_RETRY) {
+                break;
+            }
+            if (db_txn != NULL) {
+                /* Only the caller can retry its own transaction */
+                break;
+            }
+            ldbm_nasty("index_range_read_ext", "Retrying range fetch", 1091, *err);
+            slapi_log_err(SLAPI_LOG_BACKLDBM, "index_range_read_ext",
+                          "DBI_RC_RETRY on range fetch retry %d/%d for %s\n",
+                          retry_count + 1, IDL_FETCH_RETRY_COUNT, type);
+            if (retry_count + 1 < IDL_FETCH_RETRY_COUNT) {
+                ldbm_fetch_retry_sleep(retry_count);
+            }
+        }
+        if (*err == DBI_RC_RETRY && NULL == db_txn) {
+            slapi_log_err(SLAPI_LOG_ERR, "index_range_read_ext",
+                          "Range read on the %s index gave up after %d attempts "
+                          "due to transient lock conflicts. Error is %d\n",
+                          type, IDL_FETCH_RETRY_COUNT, *err);
         }
     } else { /* old idl */
         int retry_count = 0;
@@ -1777,6 +1833,9 @@ index_range_read_ext(
 #ifdef FIX_TXN_DEADLOCKS
 #error if txn != NULL, have to abort and retry the transaction, not just the fetch
 #endif
+                    if (retry_count + 1 < IDL_FETCH_RETRY_COUNT) {
+                        ldbm_fetch_retry_sleep(retry_count);
+                    }
                     continue;
                 } else {
                     break;
