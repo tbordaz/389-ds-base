@@ -31,6 +31,7 @@
 #include <time.h>
 
 #define CV_TIMEOUT    10000000  /* 10 milli seconds timeout */
+#define BULK_IMPORT_WAIT_LOG_LIMIT 10
 
 /* Value to determine when to wait before adding item to write queue and
  * when to wait until having enough item in queue to start emptying it
@@ -748,8 +749,13 @@ get_entry_type(WorkerQueueData_t *wqelmt, Slapi_DN *sdn)
     int len = SLAPI_ATTR_UNIQUEID_LENGTH;
     const char *ndn = slapi_sdn_get_ndn(sdn);
 
-    if (slapi_be_issuffix(be, sdn) && (wqelmt->wait_id == 1)) {
-        return DNRC_SUFFIX;
+    if (slapi_be_issuffix(be, sdn)) {
+        /* Is this the root suffix entry */
+        if (wqelmt->wait_id == 1) {
+            return DNRC_SUFFIX;
+        }
+        /* Duplicate root suffix entry. */
+        return DNRC_BAD_SUFFIX_ID;
     }
     if (PL_strncasecmp(ndn, SLAPI_ATTR_UNIQUEID, len) || ndn[len] != '=') {
             return DNRC_OK;
@@ -857,6 +863,16 @@ dbmdb_import_entry_info_by_param(EntryInfoParam_t *param, WorkerQueueData_t *wqe
     }
 
     dnrc = get_entry_type(wqelmt, &param->sdn);
+    if (dnrc == DNRC_BAD_SUFFIX_ID && (param->flags & EIP_RDN)) {
+        /* In reindex mode the sdn contains only the RDN. A non-root record
+         * with an explicit parentid is therefore a regular entry even when
+         * its RDN equals a one-RDN suffix. */
+        char *pidstr = NULL;
+        if (get_value_from_string(wqelmt->data, "parentid", &pidstr) == 0) {
+            slapi_ch_free_string(&pidstr);
+            dnrc = DNRC_OK;
+        }
+    }
     if (dnrc == DNRC_SUFFIX) {
         if ( param->eid != 1) {
             dnrc = DNRC_BAD_SUFFIX_ID;
@@ -1112,13 +1128,15 @@ dbmdb_import_entry_info_by_backentry(mdb_privdb_t *db, BulkQueueData_t *bqdata, 
     param.eid = wqelmt->wait_id;
     param.flags = EIP_WAIT;
     dnrc = dbmdb_import_entry_info_by_param(&param, wqelmt);
+    slapi_ch_free(&bqdata->key.mv_data);
+    bqdata->key.mv_size = 0;
     if (dnrc == DNRC_WAIT) {
         dup_data(&bqdata->wait4key, &param.pkey);
     } else {
-        bqdata->wait4key.mv_data = NULL;
+        slapi_ch_free(&bqdata->wait4key.mv_data);
         bqdata->wait4key.mv_size = 0;
+        dup_data(&bqdata->key, &param.ekey);
     }
-    dup_data(&bqdata->key, &param.ekey);
     entryinfoparam_cleanup(&param);
     return dnrc;
 }
@@ -1460,6 +1478,9 @@ dbmdb_import_prepare_worker_entry(WorkerQueueData_t *wqelmnt)
         slapi_ch_free_string(&dn);
         e = slapi_str2entry_ext(normdn, NULL, estr,
                                 flags | SLAPI_STR2ENTRY_NO_ENTRYDN);
+        if (slapi_entry_attr_get_ref(e, SLAPI_ATTR_DS_ENTRYDN) == NULL) {
+            slapi_entry_attr_set_charptr(e, SLAPI_ATTR_DS_ENTRYDN, normdn);
+        }
         slapi_ch_free_string(&normdn);
     } else {
         e = slapi_str2entry(estr, flags);
@@ -4118,6 +4139,7 @@ dbmdb_bulk_producer(void *param)
     BulkQueueData_t *entry = NULL;
     BulkQueueData_t **q, *e;
     WorkerQueueData_t tmpslot = {0};
+    MDB_val uuidkey = {0};
     mdb_privdb_t *dndb = NULL;
 
     PR_ASSERT(info != NULL);
@@ -4185,9 +4207,18 @@ dbmdb_bulk_producer(void *param)
                 thread_abort(info);
                 continue;
             case DNRC_BAD_SUFFIX_ID:
-                import_log_notice(job, SLAPI_LOG_ERR, "dbmdb_bulk_producer",
-                                  "Supplier's entry is inconsistent. (Suffix ID is %d instead of 1).", entry->id);
-                thread_abort(info);
+                import_log_notice(job, SLAPI_LOG_WARNING, "dbmdb_bulk_producer",
+                                  "Skipping duplicate suffix entry \"%s\" (wire import id %d).",
+                                  slapi_entry_get_dn(entry->ep->ep_entry), entry->id);
+                free_bulk_queue_item(&entry);
+                entry = NULL;
+                continue;
+            case DNRC_NOPARENT_DN:
+                import_log_notice(job, SLAPI_LOG_WARNING, "dbmdb_bulk_producer",
+                                  "Skipping entry \"%s\" with no extractable parent DN (wire import id %d).",
+                                  slapi_entry_get_dn(entry->ep->ep_entry), entry->id);
+                free_bulk_queue_item(&entry);
+                entry = NULL;
                 continue;
             case DNRC_NOPARENT_ID:
                 import_log_notice(job, SLAPI_LOG_ERR, "dbmdb_bulk_producer",
@@ -4210,9 +4241,25 @@ dbmdb_bulk_producer(void *param)
                 entry = NULL;
                 continue;
         }
-        /* Let move the entries that are waiting for this entry into processing queue */
+        /* Let move the entries that are waiting for this entry into
+         * processing queue.  A tombstone child waits on its parent's
+         * nsuniqueid while a regular entry's own key is its ndn, so
+         * match waiters against both keys.
+         * Note: dnrc == DNRC_OK/DNRC_SUFFIX here implies that the
+         * nsuniqueid private-db registration succeeded (a failed put
+         * mutates dnrc to DNRC_DUP/DNRC_ERROR, which the switch above
+         * diverts before reaching this loop), so this guard mirrors
+         * the registration condition exactly. */
+        uuidkey.mv_data = NULL;
+        uuidkey.mv_size = 0;
+        if ((tmpslot.dnrc == DNRC_OK || tmpslot.dnrc == DNRC_SUFFIX) &&
+            entry->ep->ep_entry->e_uniqueid) {
+            uuidkey.mv_data = entry->ep->ep_entry->e_uniqueid;
+            uuidkey.mv_size = strlen(uuidkey.mv_data) + 1;
+        }
         for (q = &waitingq; *q;) {
-            if (cmp_data(&(*q)->wait4key, &entry->key) == 0) {
+            if (cmp_data(&(*q)->wait4key, &entry->key) == 0 ||
+                (uuidkey.mv_data && cmp_data(&(*q)->wait4key, &uuidkey) == 0)) {
                 e = *q;
                 slapi_ch_free(&e->wait4key.mv_data);
                 e->wait4key.mv_size = 0;
@@ -4229,6 +4276,32 @@ dbmdb_bulk_producer(void *param)
         entry->ep = NULL; /* Should not free the backentry which is now owned by worker queue */
         free_bulk_queue_item(&entry);
         pthread_cond_broadcast(&ctx->workerq.cv);
+    }
+    if (waitingq && !info_is_finished(info)) {
+        size_t waiting_count = 0;
+        size_t waiting_logged = 0;
+
+        /* Clean end of the import with entries still waiting for a parent
+         * that never arrived: log a bounded sample and abort rather than
+         * freeing them silently (= losing entries without a trace). */
+        for (e = waitingq; e; e = e->next) {
+            if (waiting_logged < BULK_IMPORT_WAIT_LOG_LIMIT) {
+                import_log_notice(job, SLAPI_LOG_ERR, "dbmdb_bulk_producer",
+                                  "Bulk import entry \"%s\" (wire import id %d) was never "
+                                  "imported: its parent was not found in the import stream.",
+                                  e->ep ? slapi_entry_get_dn(e->ep->ep_entry) : "(unknown)",
+                                  e->id);
+                waiting_logged++;
+            }
+            waiting_count++;
+        }
+        import_log_notice(job, SLAPI_LOG_ERR, "dbmdb_bulk_producer",
+                          "Aborting bulk import: %lu entries had no parent in the import stream; "
+                          "logged %lu and omitted %lu additional entries.",
+                          (long unsigned int)waiting_count,
+                          (long unsigned int)waiting_logged,
+                          (long unsigned int)(waiting_count - waiting_logged));
+        thread_abort(info);
     }
     free_bulk_queue_list(&processingq);
     free_bulk_queue_list(&waitingq);
@@ -4377,8 +4450,10 @@ dbmdb_free_import_ctx(ImportJob *job)
         slapi_ch_free((void**)&ctx->workerq.slots);
         dbmdb_import_q_destroy(&ctx->writerq);
         dbmdb_import_q_destroy(&ctx->bulkq);
-        slapi_ch_free((void**)&ctx->id2entry->name);
-        slapi_ch_free((void**)&ctx->id2entry);
+        if (ctx->id2entry) {
+            slapi_ch_free((void**)&ctx->id2entry->name);
+            slapi_ch_free((void**)&ctx->id2entry);
+        }
         avl_free(ctx->indexes, free_ii);
         ctx->indexes = NULL;
         charray_free(ctx->indexAttrs);

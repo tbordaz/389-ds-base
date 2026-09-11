@@ -120,7 +120,8 @@ str2entry_state_information_from_type(struct berval *atype,
     *value_state = VALUE_PRESENT;
     *attr_state = ATTRIBUTE_PRESENT;
     while (p != NULL) {
-        if (p[3] == 'c' && p[4] == 's' && p[5] == 'n' && p[6] == '-') {
+        if (p[0] != '\0' && p[1] != '\0' && p[2] != '\0' &&
+            p[3] == 'c' && p[4] == 's' && p[5] == 'n' && p[6] == '-') {
             CSNType t = CSN_TYPE_UNKNOWN;
             if (p[1] == 'x' && p[2] == '1') {
                 t = CSN_TYPE_UNKNOWN;
@@ -188,8 +189,6 @@ str2entry_fast(const char *rawdn, const Slapi_RDN *srdn, const char *s, int flag
     Slapi_Entry *e;
     const char *next;
     char *ptype = NULL;
-    int nvals = 0;
-    int del_nvals = 0;
     unsigned long attr_val_cnt = 0;
     CSN *attributedeletioncsn = NULL; /* Moved to this level so that the JCM csn_free call below gets useful */
     CSNSet *valuecsnset = NULL;       /* Moved to this level so that the JCM csn_free call below gets useful */
@@ -286,8 +285,6 @@ str2entry_fast(const char *rawdn, const Slapi_RDN *srdn, const char *s, int flag
         if ((ptype == NULL) || (PL_strcasecmp(type.bv_val, ptype) != 0)) {
             slapi_ch_free_string(&ptype);
             ptype = PL_strndup(type.bv_val, type.bv_len);
-            nvals = 0;
-            del_nvals = 0;
             a = NULL;
         }
 
@@ -491,7 +488,6 @@ str2entry_fast(const char *rawdn, const Slapi_RDN *srdn, const char *s, int flag
                     &(*a)->a_deleted_values,
                     svalue,
                     SLAPI_VALUE_FLAG_PASSIN);
-                del_nvals++;
             } else {
                 /* consumes the value */
                 slapi_valueset_add_attr_value_ext(
@@ -499,7 +495,6 @@ str2entry_fast(const char *rawdn, const Slapi_RDN *srdn, const char *s, int flag
                     &(*a)->a_present_values,
                     svalue,
                     SLAPI_VALUE_FLAG_PASSIN);
-                nvals++;
             }
             if (attributedeletioncsn != NULL) {
                 attr_set_deletion_csn(*a, attributedeletioncsn);
@@ -1387,8 +1382,22 @@ entry2str_internal_size_valueset(const Slapi_Attr *a, const char *attrtype, cons
     return elen;
 }
 
+static int
+entry2str_attr_is_excluded(const char *attrtype, char **exclude_attrs)
+{
+    if (exclude_attrs == NULL || attrtype == NULL) {
+        return 0;
+    }
+    for (char **ex = exclude_attrs; *ex != NULL; ex++) {
+        if (strcasecmp(attrtype, *ex) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static size_t
-entry2str_internal_size_attrlist(const Slapi_Attr *attrlist, int entry2str_ctrl, int attribute_state)
+entry2str_internal_size_attrlist(const Slapi_Attr *attrlist, int entry2str_ctrl, int attribute_state, char **exclude_attrs)
 {
     size_t elen = 0;
     const Slapi_Attr *a;
@@ -1397,6 +1406,10 @@ entry2str_internal_size_attrlist(const Slapi_Attr *attrlist, int entry2str_ctrl,
         if ((entry2str_ctrl & SLAPI_DUMP_NOOPATTRS) &&
             slapi_attr_flag_is_set(a, SLAPI_ATTR_FLAG_OPATTR))
             continue;
+
+        if (entry2str_attr_is_excluded(a->a_type, exclude_attrs)) {
+            continue;
+        }
 
         /* Count the space required for the present and deleted values */
         elen += entry2str_internal_size_valueset(a, a->a_type, &a->a_present_values,
@@ -1542,7 +1555,7 @@ is_type_forbidden(const char *type)
 #endif
 
 static void
-entry2str_internal_put_attrlist(const Slapi_Attr *attrlist, int attr_state, int entry2str_ctrl, char **ecur, char **typebuf, size_t *typebuf_len)
+entry2str_internal_put_attrlist(const Slapi_Attr *attrlist, int attr_state, int entry2str_ctrl, char **ecur, char **typebuf, size_t *typebuf_len, char **exclude_attrs)
 {
     const Slapi_Attr *a;
 
@@ -1552,6 +1565,10 @@ entry2str_internal_put_attrlist(const Slapi_Attr *attrlist, int attr_state, int 
         if ((entry2str_ctrl & SLAPI_DUMP_NOOPATTRS) &&
             slapi_attr_flag_is_set(a, SLAPI_ATTR_FLAG_OPATTR))
             continue;
+
+        if (entry2str_attr_is_excluded(a->a_type, exclude_attrs)) {
+            continue;
+        }
 
         /* don't dump uniqueid if not asked */
         if (!(strcasecmp(a->a_type, SLAPI_ATTR_UNIQUEID) == 0 &&
@@ -1587,7 +1604,7 @@ entry2str_internal_put_attrlist(const Slapi_Attr *attrlist, int attr_state, int 
 }
 
 static char *
-entry2str_internal(Slapi_Entry *e, int *len, int entry2str_ctrl)
+entry2str_internal(Slapi_Entry *e, int *len, int entry2str_ctrl, char **exclude_attrs)
 {
     char *ebuf;
     char *ecur;
@@ -1614,12 +1631,12 @@ entry2str_internal(Slapi_Entry *e, int *len, int entry2str_ctrl)
     }
 
     /* Count the space required for the present attributes */
-    elen += entry2str_internal_size_attrlist(e->e_attrs, entry2str_ctrl, ATTRIBUTE_PRESENT);
+    elen += entry2str_internal_size_attrlist(e->e_attrs, entry2str_ctrl, ATTRIBUTE_PRESENT, exclude_attrs);
 
     /* Count the space required for the deleted attributes */
     if (entry2str_ctrl & SLAPI_DUMP_STATEINFO) {
         elen += entry2str_internal_size_attrlist(e->e_deleted_attrs, entry2str_ctrl,
-                                                 ATTRIBUTE_DELETED);
+                                                 ATTRIBUTE_DELETED, exclude_attrs);
     }
 
     elen += 1;
@@ -1632,11 +1649,11 @@ entry2str_internal(Slapi_Entry *e, int *len, int entry2str_ctrl)
     }
 
     /* Put the present attributes */
-    entry2str_internal_put_attrlist(e->e_attrs, ATTRIBUTE_PRESENT, entry2str_ctrl, &ecur, &typebuf, &typebuf_len);
+    entry2str_internal_put_attrlist(e->e_attrs, ATTRIBUTE_PRESENT, entry2str_ctrl, &ecur, &typebuf, &typebuf_len, exclude_attrs);
 
     /* Put the deleted attributes */
     if (entry2str_ctrl & SLAPI_DUMP_STATEINFO) {
-        entry2str_internal_put_attrlist(e->e_deleted_attrs, ATTRIBUTE_DELETED, entry2str_ctrl, &ecur, &typebuf, &typebuf_len);
+        entry2str_internal_put_attrlist(e->e_deleted_attrs, ATTRIBUTE_DELETED, entry2str_ctrl, &ecur, &typebuf, &typebuf_len, exclude_attrs);
     }
 
     *ecur = '\0';
@@ -1657,7 +1674,7 @@ entry2str_internal(Slapi_Entry *e, int *len, int entry2str_ctrl)
 }
 
 static char *
-entry2str_internal_ext(Slapi_Entry *e, int *len, int entry2str_ctrl)
+entry2str_internal_ext(Slapi_Entry *e, int *len, int entry2str_ctrl, char **exclude_attrs)
 {
     if (entry2str_ctrl & SLAPI_DUMP_RDN_ENTRY) /* dump rdn: ... */
     {
@@ -1691,13 +1708,13 @@ entry2str_internal_ext(Slapi_Entry *e, int *len, int entry2str_ctrl)
 
         /* Count the space required for the present attributes */
         elen += entry2str_internal_size_attrlist(e->e_attrs, entry2str_ctrl,
-                                                 ATTRIBUTE_PRESENT);
+                                                 ATTRIBUTE_PRESENT, exclude_attrs);
 
         /* Count the space required for the deleted attributes */
         if (entry2str_ctrl & SLAPI_DUMP_STATEINFO) {
             elen += entry2str_internal_size_attrlist(e->e_deleted_attrs,
                                                      entry2str_ctrl,
-                                                     ATTRIBUTE_DELETED);
+                                                     ATTRIBUTE_DELETED, exclude_attrs);
         }
 
         elen += 1;
@@ -1715,13 +1732,13 @@ entry2str_internal_ext(Slapi_Entry *e, int *len, int entry2str_ctrl)
         /* Put the present attributes */
         entry2str_internal_put_attrlist(e->e_attrs, ATTRIBUTE_PRESENT,
                                         entry2str_ctrl, &ecur,
-                                        &typebuf, &typebuf_len);
+                                        &typebuf, &typebuf_len, exclude_attrs);
 
         /* Put the deleted attributes */
         if (entry2str_ctrl & SLAPI_DUMP_STATEINFO) {
             entry2str_internal_put_attrlist(e->e_deleted_attrs,
                                             ATTRIBUTE_DELETED, entry2str_ctrl,
-                                            &ecur, &typebuf, &typebuf_len);
+                                            &ecur, &typebuf, &typebuf_len, exclude_attrs);
         }
 
         *ecur = '\0';
@@ -1742,7 +1759,7 @@ entry2str_internal_ext(Slapi_Entry *e, int *len, int entry2str_ctrl)
         return ebuf;
     } else /* dump "dn: ..." */
     {
-        return entry2str_internal(e, len, entry2str_ctrl);
+        return entry2str_internal(e, len, entry2str_ctrl, exclude_attrs);
     }
 }
 
@@ -1752,7 +1769,7 @@ entry2str_internal_ext(Slapi_Entry *e, int *len, int entry2str_ctrl)
 char *
 slapi_entry2str(Slapi_Entry *e, int *len)
 {
-    return entry2str_internal(e, len, 0);
+    return entry2str_internal(e, len, 0, NULL);
 }
 
 /*
@@ -1761,7 +1778,7 @@ slapi_entry2str(Slapi_Entry *e, int *len)
 char *
 slapi_entry2str_dump_uniqueid(Slapi_Entry *e, int *len)
 {
-    return entry2str_internal(e, len, SLAPI_DUMP_UNIQUEID);
+    return entry2str_internal(e, len, SLAPI_DUMP_UNIQUEID, NULL);
 }
 
 /*
@@ -1770,7 +1787,18 @@ slapi_entry2str_dump_uniqueid(Slapi_Entry *e, int *len)
 char *
 slapi_entry2str_no_opattrs(Slapi_Entry *e, int *len)
 {
-    return entry2str_internal(e, len, SLAPI_DUMP_NOOPATTRS);
+    return entry2str_internal(e, len, SLAPI_DUMP_NOOPATTRS, NULL);
+}
+
+/*
+ * This function converts an entry to the entry string starting with "dn: ..."
+ * Attributes listed in exclude_attrs are omitted from the output. The
+ * entry itself is not modified.
+ */
+char *
+slapi_entry2str_exclude_attrs(Slapi_Entry *e, int *len, char **exclude_attrs)
+{
+    return entry2str_internal(e, len, 0, exclude_attrs);
 }
 
 /*
@@ -1781,7 +1809,7 @@ slapi_entry2str_no_opattrs(Slapi_Entry *e, int *len)
 char *
 slapi_entry2str_with_options(Slapi_Entry *e, int *len, int options)
 {
-    return entry2str_internal_ext(e, len, options);
+    return entry2str_internal_ext(e, len, options, NULL);
 }
 
 static int entry_type = -1; /* The type number assigned by the Factory for 'Entry' */

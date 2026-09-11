@@ -1130,8 +1130,10 @@ bdb_db2ldif(Slapi_PBlock *pb)
 
             bdn = dncache_find_id(&inst->inst_dncache, temp_id);
             if (bdn) {
-                /* don't free dn */
-                dn = (char *)slapi_sdn_get_dn(bdn->dn_sdn);
+                /* Copy the dn: the cached bdn may be evicted and freed
+                 * once the reference is returned. */
+                dn = slapi_ch_strdup(slapi_sdn_get_dn(bdn->dn_sdn));
+                free_dn = true;
                 CACHE_RETURN(&inst->inst_dncache, &bdn);
                 slapi_rdn_done(&psrdn);
             } else if (return_orig_dn &&
@@ -1184,10 +1186,11 @@ bdb_db2ldif(Slapi_PBlock *pb)
                     slapi_ch_free_string(&pdn);
                 }
                 slapi_rdn_done(&psrdn);
-                /* dn is not dup'ed in slapi_sdn_new_dn_passin.
-                    * It's set to bdn and put in the dn cache. */
-                /* don't free dn */
-                sdn = slapi_sdn_new_dn_passin(dn);
+                /* Copy dn into the sdn so that dn stays valid even if
+                 * the cached bdn is freed (CACHE_ADD failure or eviction
+                 * by another thread) before we are done with it. */
+                sdn = slapi_sdn_new_dn_byval(dn);
+                free_dn = true;
                 bdn = backdn_init(sdn, temp_id, 0);
                 myrc = CACHE_ADD(&inst->inst_dncache, bdn, NULL);
                 if (myrc) {
@@ -1474,6 +1477,25 @@ bdb_db2index(Slapi_PBlock *pb)
             }
             switch (attrs[i][0]) {
             case 't': /* attribute type to index */
+            {
+                char *basename = slapi_ch_strdup(attrs[i] + 1);
+                char *colon = strchr(basename, ':');
+
+                if (colon != NULL) {
+                    *colon = '\0';
+                }
+                if (ldbm_index_entrydn_should_ignore(basename)) {
+                    /* Warn and skip obsolete entrydn */
+                    slapi_task_log_notice(task, "%s: Requested to index %s, but the index is no longer applicable",
+                                          inst->inst_name, LDBM_ENTRYDN_STR);
+                    slapi_log_err(SLAPI_LOG_WARNING,
+                                  "bdb_db2index", "%s: Requested to index %s, but the index is no longer applicable\n",
+                                  inst->inst_name, LDBM_ENTRYDN_STR);
+                    slapi_ch_free_string(&basename);
+                    break;
+                }
+                slapi_ch_free_string(&basename);
+
                 db2index_add_indexed_attr(be, attrs[i]);
                 ainfo_get(be, attrs[i] + 1, &ai);
                 /* the ai was added above, if it didn't already exist */
@@ -1490,13 +1512,6 @@ bdb_db2index(Slapi_PBlock *pb)
                     slapi_log_err(SLAPI_LOG_INFO, "bdb_db2index", "%s: Indexing: %s\n",
                                   inst->inst_name, LDBM_ENTRYRDN_STR);
                     index_ext |= DB2INDEX_ENTRYRDN;
-                } else if (strcasecmp(attrs[i] + 1, LDBM_ENTRYDN_STR) == 0) {
-                    slapi_task_log_notice(task, "%s: Requested to index %s, but the index is no longer applicable",
-                                          inst->inst_name, LDBM_ENTRYDN_STR);
-                    slapi_log_err(SLAPI_LOG_WARNING,
-                                  "bdb_db2index", "%s: Requested to index %s,but the index is no longer applicable\n",
-                                  inst->inst_name, LDBM_ENTRYDN_STR);
-                    goto err_out;
                 } else {
                     if (strcasecmp(attrs[i] + 1, SLAPI_ATTR_OBJECTCLASS) == 0) {
                         index_ext |= DB2INDEX_OBJECTCLASS;
@@ -1514,6 +1529,7 @@ bdb_db2index(Slapi_PBlock *pb)
                 }
                 dblayer_erase_index_file(be, ai, PR_TRUE, i);
                 break;
+            }
             case 'T': /* VLV Search to index */
                 vlvip = vlv_find_searchname((attrs[i]) + 1, be);
                 if (vlvip == NULL) {
@@ -1537,6 +1553,18 @@ bdb_db2index(Slapi_PBlock *pb)
                 }
                 break;
             }
+        }
+
+        /* Were the requested attrs all skipped */
+        if (attrs && attrs[0] && !indexAttrs && !LDIF2LDBM_EXTBITS(index_ext) &&
+            numvlv == 0) {
+            slapi_task_log_notice(task, "%s: No applicable indexes to rebuild",
+                                  inst->inst_name);
+            slapi_log_err(SLAPI_LOG_INFO, "bdb_db2index",
+                          "%s: No applicable indexes to rebuild\n",
+                          inst->inst_name);
+            return_value = 0;
+            goto err_out;
         }
     }
 
@@ -1654,6 +1682,7 @@ bdb_db2index(Slapi_PBlock *pb)
             char *pdn = NULL;
             ID pid = NOID;
             char *dn = NULL;
+            bool free_dn = false;
             struct backdn *bdn = NULL;
             Slapi_RDN psrdn = {0};
 
@@ -1694,8 +1723,10 @@ bdb_db2index(Slapi_PBlock *pb)
 
             bdn = dncache_find_id(&inst->inst_dncache, temp_id);
             if (bdn) {
-                /* don't free dn */
-                dn = (char *)slapi_sdn_get_dn(bdn->dn_sdn);
+                /* Copy the dn: the cached bdn may be evicted and freed
+                 * once the reference is returned. */
+                dn = slapi_ch_strdup(slapi_sdn_get_dn(bdn->dn_sdn));
+                free_dn = true;
                 CACHE_RETURN(&inst->inst_dncache, &bdn);
             } else {
                 int myrc = 0;
@@ -1749,10 +1780,11 @@ bdb_db2index(Slapi_PBlock *pb)
                                            rdn, pdn ? "," : "", pdn ? pdn : "");
                     slapi_ch_free_string(&pdn);
                 }
-                /* dn is not dup'ed in slapi_sdn_new_dn_passin.
-                 * It's set to bdn and put in the dn cache. */
-                /* don't free dn */
-                sdn = slapi_sdn_new_dn_passin(dn);
+                /* Copy dn into the sdn so that dn stays valid even if
+                 * the cached bdn is freed (CACHE_ADD failure or eviction
+                 * by another thread) before we are done with it. */
+                sdn = slapi_sdn_new_dn_byval(dn);
+                free_dn = true;
                 bdn = backdn_init(sdn, temp_id, 0);
                 myrc = CACHE_ADD(&inst->inst_dncache, bdn, NULL);
                 if (myrc) {
@@ -1772,6 +1804,9 @@ bdb_db2index(Slapi_PBlock *pb)
             ep->ep_entry = slapi_str2entry_ext(dn, NULL, data.dptr,
                                                SLAPI_STR2ENTRY_NO_ENTRYDN);
             slapi_ch_free_string(&rdn);
+            if (free_dn) {
+                slapi_ch_free_string(&dn);
+            }
         }
 
         slapi_ch_free(&(data.data));
@@ -2959,7 +2994,9 @@ _export_or_index_parents(ldbm_instance *inst,
             char *pdn = NULL;
 
             bdn = dncache_find_id(&inst->inst_dncache, pid);
-            if (!bdn) {
+            if (bdn) {
+                CACHE_RETURN(&inst->inst_dncache, &bdn);
+            } else {
                 /* we put pdn to dn cache, which could be used
                  * in _get_and_add_parent_rdns */
                 rc = entryrdn_lookup_dn(be, prdn, pid, &pdn, NULL, NULL);
@@ -2971,18 +3008,18 @@ _export_or_index_parents(ldbm_instance *inst,
                     bdn = backdn_init(psdn, pid, 0);
                     myrc = CACHE_ADD(&inst->inst_dncache, bdn, NULL);
                     if (myrc) {
-                        backdn_free(&bdn);
                         slapi_log_err(SLAPI_LOG_CACHE,
                                       "_export_or_index_parents",
                                       "%s is already in the dn cache (%d)\n",
                                       pdn, myrc);
+                        backdn_free(&bdn);
                     } else {
-                        CACHE_RETURN(&inst->inst_dncache, &bdn);
                         slapi_log_err(SLAPI_LOG_CACHE,
                                       "_export_or_index_parents",
                                       "entryrdn_lookup_dn returned: %s, "
                                       "and set to dn cache\n",
                                       pdn);
+                        CACHE_RETURN(&inst->inst_dncache, &bdn);
                     }
                 }
             }

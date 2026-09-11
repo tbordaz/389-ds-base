@@ -179,6 +179,20 @@ _set_attr_substrlen(int index, char *str, int **substrlens)
     if (NULL != p) {
         long sublen = strtol(++p, (char **)NULL, 10);
         if (sublen > 0) { /* 0 is not acceptable */
+            /*
+             * For begin and end keys, the configured value includes the
+             * anchor character ('^' for begin, '$' for end). So the
+             * actual number of value characters in the key is (N - 1).
+             * A value of 1 means 0 value characters, which produces a
+             * key that matches everything. Adjust to 2.
+             */
+            if ((index == INDEX_SUBSTRBEGIN || index == INDEX_SUBSTREND) && sublen < 2) {
+                slapi_log_err(SLAPI_LOG_WARNING, "attr_index_config",
+                              "nsMatchingRule %s value %ld is too small (minimum is 2, "
+                              "because the value includes the anchor character). "
+                              "Adjusting to 2.\n", str, sublen);
+                sublen = 2;
+            }
             if (NULL == *substrlens) {
                 *substrlens = (int *)slapi_ch_calloc(1,
                                                      sizeof(int) * INDEX_SUBSTRLEN);
@@ -673,6 +687,7 @@ attr_index_config(
     struct attrinfo *a;
     int return_value = -1;
     int *substrlens = NULL;
+    struct slapdplugin *not_compatible_ordering_mr = NULL; /* use for nsMatchingRule that are not compatible with the attribute syntax */
     int need_compare_fn = 0;
     int hasIndexType = 0;
     const char *attrsyntax_oid = NULL;
@@ -777,9 +792,26 @@ attr_index_config(
      * nsSubStrBegin: 2
      * nsSubStrMiddle: 2
      * nsSubStrEnd: 2
+     *
+     * NOTE: For begin and end, the configured value includes the anchor
+     * character ('^' for begin, '$' for end). The actual number of value
+     * characters stored in the index key is (configured_value - 1).
+     * Therefore the minimum useful value for begin and end is 2 (which
+     * gives 1 value character). A value of 1 leaves 0 value
+     * characters (key matches everything) and is adjusted to 2.
+     * For middle, there is no anchor, so the value directly equals
+     * the number of characters in the key.
      */
     substrval = slapi_entry_attr_get_int(e, INDEX_ATTR_SUBSTRBEGIN);
     if (substrval) {
+        if (substrval < 2) {
+            slapi_log_err(SLAPI_LOG_WARNING, "attr_index_config",
+                          "%s: %d is too small (minimum is 2, because the "
+                          "value includes the '^' anchor character). "
+                          "Adjusting to 2.\n",
+                          INDEX_ATTR_SUBSTRBEGIN, substrval);
+            substrval = 2;
+        }
         substrlens = (int *)slapi_ch_calloc(1, sizeof(int) * INDEX_SUBSTRLEN);
         substrlens[INDEX_SUBSTRBEGIN] = substrval;
     }
@@ -792,6 +824,14 @@ attr_index_config(
     }
     substrval = slapi_entry_attr_get_int(e, INDEX_ATTR_SUBSTREND);
     if (substrval) {
+        if (substrval < 2) {
+            slapi_log_err(SLAPI_LOG_WARNING, "attr_index_config",
+                          "%s: %d is too small (minimum is 2, because the "
+                          "value includes the '$' anchor character). "
+                          "Adjusting to 2.\n",
+                          INDEX_ATTR_SUBSTREND, substrval);
+            substrval = 2;
+        }
         if (!substrlens) {
             substrlens = (int *)slapi_ch_calloc(1, sizeof(int) * INDEX_SUBSTRLEN);
         }
@@ -840,11 +880,38 @@ attr_index_config(
             }
             /* check if this is a simple ordering specification
                for an attribute that has no ordering matching rule */
-            if (slapi_matchingrule_is_ordering(attrValue->bv_val, attrsyntax_oid) &&
+            if (slapi_matchingrule_is_ordering_only(attrValue->bv_val) &&
                 slapi_matchingrule_can_use_compare_fn(attrValue->bv_val) &&
                 !a->ai_sattr.a_mr_ord_plugin) { /* no ordering for this attribute */
-                need_compare_fn = 1;            /* get compare func for this attr */
-                do_continue = 1;                /* done with j - next j */
+                if (need_compare_fn ||
+                    slapi_matchingrule_is_compat(attrValue->bv_val, attrsyntax_oid)) {
+                    /* The user has already specified an ordering matching rule that
+                     * is compatible with the attribute syntax (need_compare_fn)
+                     * or this new ordering matching rule is compatible with the attribute syntax.
+                     * So use the ordering matching rule from the attribute syntax.
+                     * Also ignore the configured one (if it exists) that was not compatible.
+                     */
+                    not_compatible_ordering_mr = NULL;
+                    need_compare_fn = 1;            /* get compare func for this attr */
+                    do_continue = 1;                /* done with j - next j */
+                } else {
+                    /* we are here because we have not yet decided to use an ordering matching rule
+                     * from the attribute syntax (need_compare_fn) and the new ordering matching rule
+                     * is not compatible with the attribute syntax (slapi_matchingrule_is_compatible)
+                     * so we are trying to find a plugin that supports configured ordering matching rule.
+                     */
+                    not_compatible_ordering_mr = plugin_mr_find(attrValue->bv_val);
+                    if (not_compatible_ordering_mr) {
+                        /* we found a plugin that supports this ordering matching rule
+                         * we will gather the compare function from the plugin
+                         */
+                        do_continue = 1;                /* done with j - next j */
+                    } else {
+                        slapi_log_err(SLAPI_LOG_WARNING, "attr_index_config", "%s: line %d: "
+                                        "cannot use ordering matching rule \"%s\" for the attribute \"%s\" (ignored)\n",
+                                        fname, lineno, attrValue->bv_val, a->ai_type);
+                    }
+                }
             }
 
             if (do_continue) {
@@ -945,6 +1012,24 @@ attr_index_config(
                           a->ai_type, rc, ldap_err2string(rc));
             a->ai_key_cmp_fn = NULL;
         }
+    } else if (not_compatible_ordering_mr) {
+        /* use the compare fucntion from the configured ordering matching rule
+         * need to transiantly set a_mr_ord_plugin with the plugin
+         */
+        int rc;
+        a->ai_sattr.a_mr_ord_plugin = not_compatible_ordering_mr; /* a_mr_ord_plugin is NULL if  not_compatible_ordering_mr is set */
+        rc = attr_get_value_cmp_fn(&a->ai_sattr, &a->ai_key_cmp_fn);
+        if (rc == LDAP_SUCCESS) {
+            slapi_log_err(SLAPI_LOG_INFO,
+                "attr_index_config", "The attribute [%s] uses ORDERING matching rule %s\n",
+                a->ai_type, not_compatible_ordering_mr->plg_name);
+        } else {
+            slapi_log_err(SLAPI_LOG_ERR,
+                          "attr_index_config", "The attribute [%s] does not have a valid ORDERING matching rule using %s - error %d:%s\n",
+                          a->ai_type, not_compatible_ordering_mr->plg_name, rc, ldap_err2string(rc));
+            a->ai_key_cmp_fn = NULL;
+        }
+        a->ai_sattr.a_mr_ord_plugin = NULL;
     }
 
     if (avl_insert(&inst->inst_attrs, (caddr_t)a, ainfo_cmp, ainfo_dup) != 0) {

@@ -108,6 +108,8 @@ struct asyntaxinfo *attr_syntax_get_by_name_locking_optional(const char *name, P
 struct asyntaxinfo *attr_syntax_get_global_at(void);
 struct asyntaxinfo *attr_syntax_find(struct asyntaxinfo *at1, struct asyntaxinfo *at2);
 void attr_syntax_swap_ht(void);
+int attr_syntax_init_tmp(void);
+void attr_syntax_destroy_tmp(void);
 /*
  * Call attr_syntax_return(void) when you are done using a value returned
  * by attr_syntax_get_by_oid(void) or attr_syntax_get_by_name(void).
@@ -261,6 +263,7 @@ int config_set_ldapi_auto_dn_suffix(const char *attrname, char *value, char *err
 #endif
 int config_set_anon_limits_dn(const char *attrname, char *value, char *errorbuf, int apply);
 int config_set_slapi_counters(const char *attrname, char *value, char *errorbuf, int apply);
+int32_t config_set_thread_pool_stats(const char *attrname, char *value, char *errorbuf, int apply);
 int config_set_srvtab(const char *attrname, char *value, char *errorbuf, int apply);
 int config_set_sizelimit(const char *attrname, char *value, char *errorbuf, int apply);
 int config_set_pagedsizelimit(const char *attrname, char *value, char *errorbuf, int apply);
@@ -317,6 +320,10 @@ char **config_get_pw_user_attrs_array(void);
 int32_t config_set_pw_user_attrs(const char *attrname, char *value, char *errorbuf, int apply);
 char **config_get_pw_bad_words_array(void);
 int32_t config_set_pw_bad_words(const char *attrname, char *value, char *errorbuf, int apply);
+int32_t config_set_pw_breach_check(const char *attrname, char *value, char *errorbuf, int apply);
+int32_t config_set_pw_breach_url(const char *attrname, char *value, char *errorbuf, int apply);
+char *config_get_pw_breach_url(void);
+int32_t config_set_pw_breach_timeout(const char *attrname, char *value, char *errorbuf, int apply);
 int32_t config_set_pw_max_seq_sets(const char *attrname, char *value, char *errorbuf, int apply);
 int32_t config_set_pw_max_seq(const char *attrname, char *value, char *errorbuf, int apply);
 int32_t config_set_pw_max_class_repeats(const char *attrname, char *value, char *errorbuf, int apply);
@@ -426,6 +433,7 @@ int32_t config_set_maxdescriptors(const char *attrname, char *value, char *error
 int config_set_localuser(const char *attrname, char *value, char *errorbuf, int apply);
 
 int config_set_maxsimplepaged_per_conn(const char *attrname, char *value, char *errorbuf, int apply);
+int config_set_maxcontrolsperop(const char *attrname, char *value, char *errorbuf, int apply);
 
 int log_external_libs_debug_set_log_fn(void);
 int log_set_backend(const char *attrname, char *value, int logtype, char *errorbuf, int apply);
@@ -452,6 +460,7 @@ char *config_get_ldapi_auto_dn_suffix(void);
 #endif
 char *config_get_anon_limits_dn(void);
 int config_get_slapi_counters(void);
+int32_t config_get_thread_pool_stats(void);
 char *config_get_srvtab(void);
 int config_get_sizelimit(void);
 int config_get_pagedsizelimit(void);
@@ -479,6 +488,7 @@ int config_get_pw_exp(void);
 int config_get_pw_unlock(void);
 int config_get_pw_lockout(void);
 int config_get_pw_gracelimit(void);
+int32_t config_get_pwpolicy_local(void);
 int config_get_pwpolicy_inherit_global(void);
 int config_get_lastmod(void);
 int config_get_nagle(void);
@@ -631,6 +641,7 @@ int config_get_malloc_mmap_threshold(void);
 #endif
 
 int config_get_maxsimplepaged_per_conn(void);
+int config_get_maxcontrolsperop(void);
 int config_get_extract_pem(void);
 
 int32_t config_get_enable_upgrade_hash(void);
@@ -879,6 +890,8 @@ int slapd_log_audit(char *buffer, PRBool json);
 int slapd_log_auditfail(char *buffer, PRBool json);
 int32_t slapd_log_access_json(char *buffer);
 void logs_flush(void);
+void logs_maintenance_init(void);
+void logs_maintenance_shutdown(void);
 
 int access_log_openf(char *pathname, int locked);
 int security_log_openf(char *pathname, int locked);
@@ -1601,9 +1614,7 @@ int sasl_io_setup(Connection *c);
  * daemon.c
  */
 void handle_closed_connection(Connection *);
-#ifndef LINUX
-void slapd_do_nothing(int);
-#endif
+void slapd_lsan_check(void);
 void slapd_wait4child(int);
 void disk_mon_get_dirs(char ***list);
 int32_t disk_get_info(char *dir, uint64_t *total_space, uint64_t *avail_space, uint64_t *used_space);

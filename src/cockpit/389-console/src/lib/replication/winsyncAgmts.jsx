@@ -62,7 +62,8 @@ export class WinsyncAgmts extends React.Component {
             agmtWinSubtree: "",
             agmtDSSubtree: "",
             agmtOneWaySync: "both", // "both", "toWindows", "fromWindows"
-            agmtSyncInterval: "",
+            agmtSyncInterval: "300",
+            _agmtSyncInterval: "300",
             // Init agmt
             agmtInitCounter: 0,
             agmtInitIntervals: [],
@@ -105,7 +106,6 @@ export class WinsyncAgmts extends React.Component {
         this.onCreateChange = this.onCreateChange.bind(this);
         this.onEditChange = this.onEditChange.bind(this);
         this.onModalChange = this.onModalChange.bind(this);
-        this.onTAFracAttrChange = this.onTAFracAttrChange.bind(this);
         this.onTAFracAttrChangeEdit = this.onTAFracAttrChangeEdit.bind(this);
         this.createAgmt = this.createAgmt.bind(this);
         this.showEditAgmt = this.showEditAgmt.bind(this);
@@ -449,25 +449,12 @@ export class WinsyncAgmts extends React.Component {
     }
 
     onTAFracAttrChangeEdit (selection) {
-        const e = { target: { id: 'dummy', value: "", type: 'input' } };
+        const e = { target: { id: 'agmtFracAttrs', value: "", type: 'input', name: 'agmt-modal'} };
         const newFracAttrs = Array.isArray(selection) ? selection : [];
         this.setState({
             agmtFracAttrs: newFracAttrs,
             isExcludeAttrsEditOpen: false,
         }, () => { this.onEditChange(e) });
-    }
-
-    onTAFracAttrChange (values) {
-        const e = {
-            target: {
-                name: 'agmt-modal',
-                id: 'agmtFracAttrs',
-                value: values,
-                type: 'input',
-                toggle: 'isExcludeAttrCreateOpen',
-            }
-        };
-        this.handleChange(e);
     }
 
     showConfirmDeleteAgmt (agmtName) {
@@ -531,7 +518,8 @@ export class WinsyncAgmts extends React.Component {
             agmtWinSubtree: "",
             agmtDSSubtree: "",
             agmtOneWaySync: "both", // "both", "toWindows", "fromWindows"
-            agmtSyncInterval: "",
+            agmtSyncInterval: "300",
+            _agmtSyncInterval: "300",
             errObj: {
                 // Marks all these fields as required
                 agmtName: true,
@@ -567,7 +555,7 @@ export class WinsyncAgmts extends React.Component {
 
         log_cmd('showEditAgmt', 'Edit winsync agreement', cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     let agmtName = "";
@@ -594,7 +582,7 @@ export class WinsyncAgmts extends React.Component {
                     let agmtWinSubtree = "";
                     let agmtDSSubtree = "";
                     let agmtOneWaySync = "both";
-                    let agmtSyncInterval = "";
+                    let agmtSyncInterval = "300";
 
                     for (const attr in config.attrs) {
                         const val = config.attrs[attr][0];
@@ -869,7 +857,7 @@ export class WinsyncAgmts extends React.Component {
             'repl-winsync-agmt', 'poke', agmtName, '--suffix=' + this.props.suffix];
         log_cmd('pokeAgmt', 'send updates now', cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     this.props.reload(this.props.suffix);
                     this.props.addNotification(
@@ -894,7 +882,7 @@ export class WinsyncAgmts extends React.Component {
             'repl-winsync-agmt', 'init', '--suffix=' + this.props.suffix, this.state.agmtName];
         log_cmd('initAgmt', 'Initialize winsync agreement', init_cmd);
         cockpit
-                .spawn(init_cmd, { superuser: true, err: "message" })
+                .spawn(init_cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const agmtIntervalCount = this.state.agmtInitCounter + 1;
                     const intervals = this.state.agmtInitIntervals;
@@ -960,7 +948,7 @@ export class WinsyncAgmts extends React.Component {
             modalSpinning: true
         });
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     this.props.reload(this.props.suffix);
                     this.props.addNotification(
@@ -985,7 +973,7 @@ export class WinsyncAgmts extends React.Component {
             modalSpinning: true
         });
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     this.props.reload(this.props.suffix);
                     this.props.addNotification(
@@ -1009,7 +997,7 @@ export class WinsyncAgmts extends React.Component {
             'repl-winsync-agmt', 'delete', '--suffix=' + this.props.suffix, this.state.agmtName];
         log_cmd('deleteAgmt', 'Delete agmt', cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     this.props.reload(this.props.suffix);
                     this.props.addNotification(
@@ -1126,7 +1114,7 @@ export class WinsyncAgmts extends React.Component {
             'repl-winsync-agmt', 'init-status', '--suffix=' + this.props.suffix, agmtName];
         log_cmd('watchAgmtInit', 'Get initialization status for agmt', status_cmd);
         cockpit
-                .spawn(status_cmd, { superuser: true, err: "message" })
+                .spawn(status_cmd, { superuser: "require", err: "message" })
                 .done(data => {
                     const init_status = JSON.parse(data);
                     if (init_status.startsWith('Agreement successfully initialized') ||
@@ -1212,7 +1200,7 @@ export class WinsyncAgmts extends React.Component {
                     closeHandler={this.closeCreateAgmtModal}
                     handleChange={this.onCreateChange}
                     handleTimeChange={this.onTimeChange}
-                    handleFracChange={this.onTAFracAttrChange}
+                    handleFracChange={this.onTAFracAttrChangeEdit}
                     onSelectToggle={this.handleExcludeAttrCreateToggle}
                     onSelectClear={this.handleExcludeAttrCreateClear}
                     isExcludeAttrOpen={this.state.isExcludeAttrCreateOpen}

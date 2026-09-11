@@ -10,6 +10,7 @@ import { Suffix } from "./lib/database/suffix.jsx";
 import { Backups } from "./lib/database/backups.jsx";
 import { GlobalPwPolicy } from "./lib/database/globalPwp.jsx";
 import { LocalPwPolicy } from "./lib/database/localPwp.jsx";
+import { PwpFixupTasks } from "./lib/database/pwpFixupTasks.jsx";
 import {
     Button,
     Card,
@@ -40,6 +41,7 @@ import {
     ExternalLinkAltIcon,
     KeyIcon,
     UsersIcon,
+    WrenchIcon,
 } from '@patternfly/react-icons';
 import { PropTypes } from "prop-types";
 import { ExclamationCircleIcon } from '@patternfly/react-icons/dist/js/icons/exclamation-circle-icon';
@@ -52,6 +54,7 @@ const CHAINING_CONFIG = "chaining-config";
 const BACKUP_CONFIG = "backups";
 const PWP_CONFIG = "pwpolicy";
 const LOCAL_PWP_CONFIG = "localpwpolicy";
+const PWP_FIXUP_TASK = "pwp-fixup";
 const BE_IMPL_BDB = "bdb";
 const BE_IMPL_MDB = "mdb";
 
@@ -216,7 +219,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadSuffixList", "Get a list of all the suffixes", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const suffixList = JSON.parse(content);
                     this.setState(() => (
@@ -255,7 +258,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadPwdStorageSchemes", "Get a list of all the password storage sehemes", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const schemes = JSON.parse(content);
                     this.setState(() => (
@@ -293,7 +296,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadNDN", "Load NDN cache size", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     const attrs = config.attrs;
@@ -341,7 +344,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadGlobalConfig", "Load the database global configuration", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     const attrs = config.attrs;
@@ -370,10 +373,11 @@ export class Database extends React.Component {
                             dblocksMonitoring = true;
                         }
 
-                        this.setState(() => (
+                        this.setState((prevState) => (
                             {
                                 globalDBConfig:
                                     {
+                                        ...prevState.globalDBConfig,
                                         loading: false,
                                         activeTab,
                                         db_cache_auto,
@@ -401,6 +405,7 @@ export class Database extends React.Component {
                                         dynamiclistattr: attrs['nsslapd-dynamic-lists-attr'][0],
                                         dynamicoc: attrs['nsslapd-dynamic-lists-oc'][0],
                                         dynamicurlattr: attrs['nsslapd-dynamic-lists-url-attr'][0],
+                                        ndncachemaxsize: '0',
                                     },
                                 configUpdated: 1
                             }), () => {
@@ -416,10 +421,11 @@ export class Database extends React.Component {
                             db_cache_auto = true;
                         }
 
-                        this.setState(() => (
+                        this.setState((prevState) => (
                             {
                                 globalDBConfig:
                                     {
+                                        ...prevState.globalDBConfig,
                                         loading: false,
                                         activeTab,
                                         looklimit: attrs['nsslapd-lookthroughlimit'][0],
@@ -436,6 +442,7 @@ export class Database extends React.Component {
                                         dynamiclistattr: attrs['nsslapd-dynamic-lists-attr'][0],
                                         dynamicoc: attrs['nsslapd-dynamic-lists-oc'][0],
                                         dynamicurlattr: attrs['nsslapd-dynamic-lists-url-attr'][0],
+                                        ndncachemaxsize: '0',
                                     },
                                 configUpdated: 1
                             }), () => {
@@ -462,7 +469,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadAvailableControls", "Get available controls", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     const availableOids = config.items.filter((el) => !this.state.chainingConfig.oidList.includes(el));
@@ -486,7 +493,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadDefaultConfig", "Load chaining default configuration", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     const attr = config.attrs;
@@ -552,7 +559,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadChainingConfig", "Load chaining OIDs and Controls", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     let availableComps = config.attrs.nspossiblechainingcomponents;
@@ -655,6 +662,11 @@ export class Database extends React.Component {
                         icon: <UsersIcon />,
                         id: "localpwpolicy",
                     },
+                    {
+                        name: _("Fix-up Tasks"),
+                        icon: <WrenchIcon />,
+                        id: "pwp-fixup",
+                    },
                 ],
                 defaultExpanded: true
             },
@@ -683,7 +695,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadSuffixTree", "Start building the suffix tree", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     let suffixData = [];
                     if (content !== "") {
@@ -731,7 +743,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadChainingLink", "Load chaining link configuration", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     const attrs = config.attrs;
@@ -805,6 +817,7 @@ export class Database extends React.Component {
             treeViewItem.id === "chaining-config" ||
             treeViewItem.id === "pwpolicy" ||
             treeViewItem.id === "localpwpolicy" ||
+            treeViewItem.id === "pwp-fixup" ||
             treeViewItem.id === "backups") {
             // Nothing special to do, these configurations have already been loaded
             this.setState(prevState => {
@@ -998,7 +1011,7 @@ export class Database extends React.Component {
 
         log_cmd("createSuffix", "Create a new backend", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     this.closeSuffixModal();
                     this.props.addNotification(
@@ -1032,7 +1045,7 @@ export class Database extends React.Component {
         ];
         log_cmd("getAutoTuning", "Check cache auto tuning", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     if ('nsslapd-cache-autosize' in config.attrs &&
@@ -1055,7 +1068,7 @@ export class Database extends React.Component {
         const tableKey = this.state.vlvTableKey + 1;
         log_cmd("loadVLV", "Load VLV indexes", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     this.setState({
@@ -1075,7 +1088,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadAttrEncrypt", "Load encrypted attrs", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     const rows = [];
@@ -1101,7 +1114,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadIndexes", "Load backend indexes", index_cmd);
         cockpit
-                .spawn(index_cmd, { superuser: true, err: "message" })
+                .spawn(index_cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     // Now do the Indexes
                     const config = JSON.parse(content);
@@ -1153,7 +1166,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadReferrals", "get referrals", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     let refs = [];
@@ -1191,7 +1204,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadSuffix", "Load suffix config", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     let refs = [];
@@ -1232,7 +1245,7 @@ export class Database extends React.Component {
                     ];
                     log_cmd("loadSuffix", "Load VLV indexes", cmd);
                     cockpit
-                            .spawn(cmd, { superuser: true, err: "message" })
+                            .spawn(cmd, { superuser: "require", err: "message" })
                             .done(content => {
                                 const config = JSON.parse(content);
                                 this.setState({
@@ -1254,7 +1267,7 @@ export class Database extends React.Component {
                                 ];
                                 log_cmd("loadAttrEncrypt", "Load encrypted attrs", cmd);
                                 cockpit
-                                        .spawn(cmd, { superuser: true, err: "message" })
+                                        .spawn(cmd, { superuser: "require", err: "message" })
                                         .done(content => {
                                             const config = JSON.parse(content);
                                             const rows = [];
@@ -1279,7 +1292,7 @@ export class Database extends React.Component {
                                             ];
                                             log_cmd("loadIndexes", "Load backend indexes", index_cmd);
                                             cockpit
-                                                    .spawn(index_cmd, { superuser: true, err: "message" })
+                                                    .spawn(index_cmd, { superuser: "require", err: "message" })
                                                     .done(content => {
                                                         // Now do the Indexes
                                                         const config = JSON.parse(content);
@@ -1374,7 +1387,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadLDIFs", "Load LDIF Files", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     const rows = [];
@@ -1420,7 +1433,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadBackupsDatabase", "Load Backups", cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: "message" })
+                .spawn(cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const config = JSON.parse(content);
                     const rows = [];
@@ -1466,7 +1479,7 @@ export class Database extends React.Component {
         ];
         log_cmd("loadSchema", "Plugins Get attrs", attr_cmd);
         cockpit
-                .spawn(attr_cmd, { superuser: true, err: "message" })
+                .spawn(attr_cmd, { superuser: "require", err: "message" })
                 .done(content => {
                     const attrContent = JSON.parse(content);
                     const attrs = [];
@@ -1484,7 +1497,7 @@ export class Database extends React.Component {
                     ];
                     log_cmd("loadSchema", "Get objectClasses", oc_cmd);
                     cockpit
-                            .spawn(oc_cmd, { superuser: true, err: "message" })
+                            .spawn(oc_cmd, { superuser: "require", err: "message" })
                             .done(content => {
                                 const ocContent = JSON.parse(content);
                                 const ocs = [];
@@ -1584,6 +1597,14 @@ export class Database extends React.Component {
                         enableTree={this.enableTree}
                     />
                 );
+            } else if (this.state.node_name === PWP_FIXUP_TASK) {
+                db_element = (
+                    <PwpFixupTasks
+                        serverId={this.props.serverId}
+                        addNotification={this.props.addNotification}
+                        suffixes={this.state.suffixList}
+                    />
+                );
             } else if (this.state.node_name === BACKUP_CONFIG) {
                 db_element = (
                     <Backups
@@ -1594,6 +1615,7 @@ export class Database extends React.Component {
                         ldifs={this.state.LDIFRows}
                         enableTree={this.enableTree}
                         handleReload={(refreshing) => this.loadBackups(refreshing, true)}
+                        handleLDIFReload={(refreshing) => this.loadLDIFs(refreshing, true)}
                         refreshing={this.state.backupRefreshing}
                     />
                 );

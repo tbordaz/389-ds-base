@@ -327,6 +327,7 @@ void add_update_entrydn_operational_attributes(struct backentry *ep);
  * misc.c
  */
 void ldbm_nasty(const char *func, const char *str, int c, int err);
+void ldbm_fetch_retry_sleep(int retry_count);
 void ldbm_log_access_message(Slapi_PBlock *pblock, char *string);
 int return_on_disk_full(struct ldbminfo *li);
 int ldbm_attribute_always_indexed(const char *attrtype);
@@ -637,6 +638,7 @@ int ldbm_set_last_usn(Slapi_Backend *be);
 /*
  * ldbm_entryrdn.c
  */
+int ldbm_index_entrydn_should_ignore(const char *index_name);
 int entryrdn_index_entry(backend *be, struct backentry *e, int flags, back_txn *txn);
 int entryrdn_index_read(backend *be, const Slapi_DN *sdn, ID *id, back_txn *txn);
 int

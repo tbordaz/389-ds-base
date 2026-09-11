@@ -286,16 +286,19 @@ fi
 AC_SUBST([profiling_defs])
 AC_SUBST([profiling_links])
 
-AC_MSG_CHECKING(for --enable-systemtap)
-AC_ARG_ENABLE(systemtap, AS_HELP_STRING([--enable-systemtap], [Enable systemtap probe features (default: no)]),
-              [], [ enable_systemtap=no ])
-AC_MSG_RESULT($enable_systemtap)
-if test "$enable_systemtap" = yes ; then
-  systemtap_defs="-DSYSTEMTAP"
+AC_MSG_CHECKING(for --enable-usdt)
+AC_ARG_ENABLE(usdt, AS_HELP_STRING([--enable-usdt], [Enable USDT (User-level Statically Defined Tracing) probes, consumed by bpftrace, SystemTap, dtrace, perf (default: no)]),
+              [], [ enable_usdt=no ])
+AC_MSG_RESULT($enable_usdt)
+if test "$enable_usdt" = yes ; then
+  AC_CHECK_HEADER([sys/sdt.h], [],
+    [AC_MSG_ERROR([USDT support requires <sys/sdt.h>. Install systemtap-sdt-devel (Fedora/RHEL) or systemtap-sdt-dev (Debian/Ubuntu).])])
+  usdt_defs="-DUSDT"
 else
-  systemtap_defs=""
+  usdt_defs=""
 fi
-AC_SUBST([systemtap_defs])
+AC_SUBST([usdt_defs])
+AM_CONDITIONAL([USDT], [test "$enable_usdt" = yes])
 
 
 # these enables are for optional or experimental features
@@ -538,6 +541,12 @@ fi
 if test X"$mandir" = X'${prefix}/man' ; then
    mandir='$(datadir)/man'
 fi
+
+# put libexec scripts under dirsrv subdir
+case "$libexecdir" in
+  */$PACKAGE_NAME|*/$PACKAGE_NAME/) ;;
+  *) libexecdir="$libexecdir/$PACKAGE_NAME" ;;
+esac
 
 # Shared paths for all layouts
 # relative to sysconfdir
@@ -881,6 +890,18 @@ fi
 AC_SUBST(nss_libdir)
 
 PKG_CHECK_MODULES([OPENSSL], [openssl])
+
+AC_MSG_CHECKING(whether to enable HIBP password breach checking)
+AC_ARG_ENABLE(hibp, AS_HELP_STRING([--enable-hibp], [Enable HIBP password breach checking (default: no)]),
+              [], [enable_hibp=no])
+if test "x$enable_hibp" = "xyes"; then
+    AC_MSG_RESULT(yes)
+    PKG_CHECK_MODULES([CURL], [libcurl >= 7.61])
+    AC_DEFINE([ENABLE_HIBP], [1], [Enable HIBP password breach checking])
+else
+    AC_MSG_RESULT(no)
+fi
+AM_CONDITIONAL([ENABLE_HIBP], [test "x$enable_hibp" = "xyes"])
 
 m4_include(m4/openldap.m4)
 if test $with_bundle_libdb = no; then

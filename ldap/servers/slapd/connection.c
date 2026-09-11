@@ -22,10 +22,14 @@
 #include "prcvar.h"
 #include "prlog.h" /* for PR_ASSERT */
 #include "fe.h"
+#include "threadpool_stats.h"
 #include <sasl/sasl.h>
 #include <stdbool.h>
 #if defined(LINUX)
 #include <netinet/tcp.h> /* for TCP_CORK */
+#endif
+#ifdef USDT
+#include <sys/sdt.h>
 #endif
 
 typedef Connection work_q_item;
@@ -434,7 +438,7 @@ connection_reset(Connection *conn, int ns, PRNetAddr *from, int fromLen __attrib
 
 /* Create a pool of threads for handling the operations */
 void
-init_op_threads()
+init_op_threads(int32_t threadnumber)
 {
     pthread_condattr_t condAttr;
     int32_t rc;
@@ -464,12 +468,12 @@ init_op_threads()
     }
     pthread_condattr_destroy(&condAttr); /* no longer needed */
 
+    max_threads = threadnumber;
     work_q_stack = PR_CreateStack("connection_work_q");
     op_stack = PR_CreateStack("connection_operation");
     alloc_per_thread_snmp_vars(max_threads);
     init_thread_private_snmp_vars();
 
-    max_threads = config_get_threadnumber();
     threads_indexes = (int32_t *) slapi_ch_calloc(max_threads, sizeof(int32_t));
     for (size_t i = 0; i < max_threads; i++) {
         threads_indexes[i] = i + 1; /* idx 0 is reserved for global snmp_vars */
@@ -1080,7 +1084,24 @@ connection_wait_for_new_work(Slapi_PBlock *pb, int32_t interval)
         }
     }
 
+#ifdef USDT
+    /* Snapshot probe args under the lock; same pattern as add_work_q. */
+    uint64_t probe_connid = 0;
+    int probe_opid = 0;
+    int32_t probe_depth = 0;
+    if (wqitem != NULL) {
+        probe_connid = wqitem->c_connid;
+        probe_opid = op_stack_obj->op->o_opid;
+        probe_depth = work_q_size;
+    }
+#endif
     pthread_mutex_unlock(&work_q_lock);
+
+#ifdef USDT
+    if (wqitem != NULL) {
+        STAP_PROBE3(ns-slapd, work_q__dequeue, probe_connid, probe_opid, probe_depth);
+    }
+#endif
     return ret;
 }
 
@@ -1421,6 +1442,18 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
             syserr = PR_GetOSError();
             if (SLAPD_PR_WOULD_BLOCK_ERROR(err) ||
                 SLAPD_SYSTEM_WOULD_BLOCK_ERROR(syserr)) {
+
+                /*
+                 * We blocked, is this the first read in a PDU? We don't want to
+                 * wait here on a new operation, but we do if there is actually data coming
+                 * in and getting queued up.
+                 */
+                if (new_operation && !conn_buffered_data_avail_nolock(conn, &conn_closed)) {
+                    /* If so, we return */
+                    ret = CONN_TIMEDOUT;
+                    goto done;
+                }
+
                 struct PRPollDesc pr_pd;
                 PRIntervalTime timeout = PR_MillisecondsToInterval(CONN_TURBO_TIMEOUT_INTERVAL);
                 pr_pd.fd = (PRFileDesc *)conn->c_prfd;
@@ -1437,29 +1470,22 @@ connection_read_operation(Connection *conn, Operation *op, ber_tag_t *tag, int *
                         ret = CONN_SHUTDOWN;
                         goto done;
                     }
-                    /* We timed out, is this the first read in a PDU ? */
-                    if (new_operation) {
-                        /* If so, we return */
-                        ret = CONN_TIMEDOUT;
+                    /* Loop, unless we exceeded the ioblock timeout */
+                    if (waits_done > ioblocktimeout_waits) {
+                        slapi_log_err(SLAPI_LOG_CONNS, "connection_read_operation",
+                                      "ioblocktimeout expired on connection %" PRIu64 "\n", conn->c_connid);
+                        disconnect_server_nomutex(conn, conn->c_connid, -1,
+                                                  SLAPD_DISCONNECT_IO_TIMEOUT, 0);
+                        ret = CONN_DONE;
                         goto done;
                     } else {
-                        /* Otherwise we loop, unless we exceeded the ioblock timeout */
-                        if (waits_done > ioblocktimeout_waits) {
-                            slapi_log_err(SLAPI_LOG_CONNS, "connection_read_operation",
-                                          "ioblocktimeout expired on connection %" PRIu64 "\n", conn->c_connid);
-                            disconnect_server_nomutex(conn, conn->c_connid, -1,
-                                                      SLAPD_DISCONNECT_IO_TIMEOUT, 0);
-                            ret = CONN_DONE;
-                            goto done;
-                        } else {
 
-                            /* The turbo mode may cause threads starvation.
-                                  Do a yield here to reduce the starving.
-                            */
-                            PR_Sleep(PR_INTERVAL_NO_WAIT);
+                        /* The turbo mode may cause threads starvation.
+                              Do a yield here to reduce the starving.
+                        */
+                        PR_Sleep(PR_INTERVAL_NO_WAIT);
 
-                            continue;
-                        }
+                        continue;
                     }
                 }
                 if (-1 == ret) {
@@ -1710,6 +1736,7 @@ connection_threadmain(void *arg)
     char tname[16];
     snprintf(tname, sizeof(tname), "worker-%d", *snmp_vars_idx);
     slapi_set_thread_name(tname);
+    tp_stats_worker_idle((uint32_t)*snmp_vars_idx);
     /* wait forever for new pb until one is available or shutdown */
     int32_t interval = 0; /* used be  10 seconds */
     Connection *conn = NULL;
@@ -1721,7 +1748,6 @@ connection_threadmain(void *arg)
     int replication_connection = 0; /* If this connection is from a replication supplier, we want to ensure that operation processing is serialized */
     int doshutdown = 0;
     int maxthreads = 0;
-    long bypasspollcnt = 0;
     bool is_busy = false;
 
 #if defined(hpux)
@@ -1740,6 +1766,7 @@ connection_threadmain(void *arg)
             if (is_busy) {
                 slapi_atomic_decr_32(&current_busy_workers, __ATOMIC_ACQ_REL);
             }
+            tp_stats_worker_exited((uint32_t)*snmp_vars_idx);
             slapi_pblock_destroy(pb);
             g_decr_active_threadcnt();
             return;
@@ -1753,11 +1780,15 @@ connection_threadmain(void *arg)
                 is_busy = false;
                 slapi_atomic_decr_32(&current_busy_workers, __ATOMIC_ACQ_REL);
             }
+            tp_stats_worker_idle((uint32_t)*snmp_vars_idx);
 
             /* If more data is left from the previous connection_read_operation,
                we should finish the op now.  Client might be thinking it's
                done sending the request and wait for the response forever.
                [blackflag 624234] */
+#ifdef USDT
+            STAP_PROBE1(ns-slapd, worker__idle, *snmp_vars_idx);
+#endif
             ret = connection_wait_for_new_work(pb, interval);
 
             switch (ret) {
@@ -1770,6 +1801,7 @@ connection_threadmain(void *arg)
                 if (is_busy) {
                     slapi_atomic_decr_32(&current_busy_workers, __ATOMIC_ACQ_REL);
                 }
+                tp_stats_worker_exited((uint32_t)*snmp_vars_idx);
                 slapi_pblock_destroy(pb);
                 g_decr_active_threadcnt();
                 return;
@@ -1785,6 +1817,7 @@ connection_threadmain(void *arg)
                     if (is_busy) {
                         slapi_atomic_decr_32(&current_busy_workers, __ATOMIC_ACQ_REL);
                     }
+                    tp_stats_worker_exited((uint32_t)*snmp_vars_idx);
                     slapi_pblock_destroy(pb);
                     g_decr_active_threadcnt();
                     return;
@@ -1861,6 +1894,7 @@ connection_threadmain(void *arg)
             while (val > slapi_atomic_load_32(&max_busy_workers, __ATOMIC_RELAXED)) {
                 slapi_atomic_store_32(&max_busy_workers, val, __ATOMIC_RELAXED);
             }
+            tp_stats_worker_busy((uint32_t)*snmp_vars_idx);
         }
         slapi_pblock_get(pb, SLAPI_CONNECTION, &conn);
         slapi_pblock_get(pb, SLAPI_OPERATION, &op);
@@ -1869,6 +1903,7 @@ connection_threadmain(void *arg)
             if (is_busy) {
                 slapi_atomic_decr_32(&current_busy_workers, __ATOMIC_ACQ_REL);
             }
+            tp_stats_worker_exited((uint32_t)*snmp_vars_idx);
             slapi_pblock_destroy(pb);
             g_decr_active_threadcnt();
             return;
@@ -1992,7 +2027,6 @@ connection_threadmain(void *arg)
                  * so need locking from here on */
                 signal_listner(conn->c_ct_list);
             } else { /* more data in conn - just put back on work_q - bypass poll */
-                bypasspollcnt++;
                 pthread_mutex_lock(&(conn->c_mutex));
                 /* don't do this if it would put us over the max threads per conn */
                 if (conn->c_threadnumber < maxthreads) {
@@ -2028,6 +2062,9 @@ connection_threadmain(void *arg)
                                 "New operations will be blocked.\n",
                                 conn->c_connid);
                     }
+#ifdef USDT
+                    STAP_PROBE2(ns-slapd, work__blocked, conn->c_connid, op->o_opid);
+#endif
                 }
                 pthread_mutex_unlock(&(conn->c_mutex));
             }
@@ -2066,9 +2103,17 @@ connection_threadmain(void *arg)
             operation_set_flag(op, OP_FLAG_REPLICATED);
         }
 
+#ifdef USDT
+        /* Fire just before dispatch so op_tag reflects the request actually
+         * being executed (set by connection_read_operation above). */
+        STAP_PROBE4(ns-slapd, worker__busy, conn->c_connid, op->o_opid,
+                    tag, thread_turbo_flag);
+#endif
+
         /*
          * Call the do_<operation> function to process this request.
          */
+        tp_stats_worker_operation_start((uint32_t)*snmp_vars_idx, conn->c_connid, (uint64_t)op->o_opid, (uint32_t)op->o_tag);
         connection_dispatch_operation(conn, op, pb);
 
     done:
@@ -2076,6 +2121,7 @@ connection_threadmain(void *arg)
             if (is_busy) {
                 slapi_atomic_decr_32(&current_busy_workers, __ATOMIC_ACQ_REL);
             }
+            tp_stats_worker_exited((uint32_t)*snmp_vars_idx);
             pthread_mutex_lock(&(conn->c_mutex));
             connection_remove_operation_ext(pb, conn, op);
             connection_make_readable_nolock(conn);
@@ -2099,6 +2145,7 @@ connection_threadmain(void *arg)
         PR_AtomicIncrement(&conn->c_opscompleted);
         /* total number of ops for the server */
         slapi_counter_increment(g_get_per_thread_snmp_vars()->server_tbl.dsOpCompleted);
+        tp_stats_worker_operation_done((uint32_t)*snmp_vars_idx);
         /* If this op isn't a persistent search, remove it */
         if (op->o_flags & OP_FLAG_PS) {
             /* Release the connection (i.e. decrease refcnt) at the condition
@@ -2249,7 +2296,17 @@ add_work_q(work_q_item *wqitem, struct Slapi_op_stack *op_stack_obj)
         work_q_size_max = work_q_size;
     }
     pthread_cond_signal(&work_q_cv); /* notify waiters in connection_wait_for_new_work */
+#ifdef USDT
+    /* Snapshot under the lock: op_stack pool recycling can zero o_opid before the probe fires. */
+    uint64_t probe_connid = wqitem->c_connid;
+    int probe_opid = op_stack_obj->op->o_opid;
+    int32_t probe_depth = work_q_size;
+#endif
     pthread_mutex_unlock(&work_q_lock);
+
+#ifdef USDT
+    STAP_PROBE3(ns-slapd, work_q__enqueue, probe_connid, probe_opid, probe_depth);
+#endif
 }
 
 /* get_work_q(): will get a work_q_item from the beginning of the work queue, return NULL if

@@ -46,6 +46,7 @@ import { ENTRY_MENU } from './lib/constants.jsx';
 import EditorTableView from './tableView.jsx';
 import { getApiErrorMessage, log_cmd, valid_dn } from '../tools.jsx';
 import GenericWizard from './wizards/genericWizard.jsx';
+import { EffectivePwpModal } from './effectivePwpModal.jsx';
 
 const _ = cockpit.gettext;
 
@@ -104,6 +105,28 @@ export class SearchDatabase extends React.Component {
             isWizardOpen: false,
             wizardEntryDn: '',
             treeViewRootSuffixes: [], // TODO when aci's are ready (is there a better list of suffixes?)
+            showPwpModal: false,
+            pwpModalEntryDn: '',
+            pwpModalUserType: '',
+            pwpModalSelector: '',
+        };
+
+        this.handlePwpModalClose = () => {
+            this.setState({
+                showPwpModal: false,
+                pwpModalEntryDn: '',
+                pwpModalUserType: '',
+                pwpModalSelector: '',
+            });
+        };
+
+        this.openPwpModal = (entryDn, userPwpLookup) => {
+            this.setState({
+                showPwpModal: true,
+                pwpModalEntryDn: entryDn,
+                pwpModalUserType: userPwpLookup.userType,
+                pwpModalSelector: userPwpLookup.selector,
+            });
         };
 
         this.initialResultText = _("Loading ...");
@@ -354,7 +377,7 @@ export class SearchDatabase extends React.Component {
                         "-b", info.dn, info.isRole ? "role" : "account", "entry-status", info.dn];
                     log_cmd("processResults", "Checking if entry is activated", cmd);
                     cockpit
-                            .spawn(cmd, { superuser: true, err: 'message' })
+                            .spawn(cmd, { superuser: "require", err: 'message' })
                             .done(content => {
                                 if (info.isLockable) {
                                     const status = JSON.parse(content);
@@ -419,7 +442,9 @@ export class SearchDatabase extends React.Component {
                                         rawdn: info.dn,
                                         isLockable: info.isLockable,
                                         isRole: info.isRole,
-                                        entryState
+                                        entryState,
+                                        isUser: info.isUser,
+                                        userPwpLookup: info.userPwpLookup,
                                     },
                                     {
                                         parent: rowNumber,
@@ -465,7 +490,9 @@ export class SearchDatabase extends React.Component {
                                 info.modifyTimestamp,
                             ],
                             rawdn: info.dn,
-                            entryState: ""
+                            entryState: "",
+                            isUser: info.isUser,
+                            userPwpLookup: info.userPwpLookup,
                         },
                         {
                             parent: rowNumber,
@@ -560,7 +587,7 @@ export class SearchDatabase extends React.Component {
             "-b", entryDn, entryType, operationType, entryDn];
         log_cmd("handleLockUnlockEntry", `${operationType} entry`, cmd);
         cockpit
-                .spawn(cmd, { superuser: true, err: 'message' })
+                .spawn(cmd, { superuser: "require", err: 'message' })
                 .done(_ => {
                     this.setState({
                         entryMenuIsOpen: !this.state.entryMenuIsOpen,
@@ -702,6 +729,12 @@ export class SearchDatabase extends React.Component {
                     });
                 }
             },
+            ...(rowData.isUser && rowData.userPwpLookup ? [{
+                title: _("View Password Policy ..."),
+                onClick: () => {
+                    this.openPwpModal(rowData.rawdn, rowData.userPwpLookup);
+                }
+            }] : []),
             {
                 isSeparator: true
             },
@@ -765,6 +798,15 @@ export class SearchDatabase extends React.Component {
                         allObjectclasses={this.props.allObjectclasses}
                     />
                 )}
+                <EffectivePwpModal
+                    isOpen={this.state.showPwpModal}
+                    onClose={this.handlePwpModalClose}
+                    serverId={this.props.serverId}
+                    suffixList={this.props.suffixList}
+                    entryDn={this.state.pwpModalEntryDn}
+                    userType={this.state.pwpModalUserType}
+                    selector={this.state.pwpModalSelector}
+                />
                 <Form className="ds-margin-top-lg" isHorizontal autoComplete="off">
                     <Grid className="ds-margin-left">
                         <div className="ds-container">
@@ -774,7 +816,7 @@ export class SearchDatabase extends React.Component {
                                 </Text>
                             </TextContent>
                             <Grid className="ds-left-margin">
-                                <GridItem span={4}>
+                                <GridItem span={5}>
                                     <FormSelect
                                         id="searchSuffix"
                                         value={baseDN}
@@ -792,14 +834,14 @@ export class SearchDatabase extends React.Component {
                                             <FormSelectOption isDisabled key="No database" value="" label={_("No databases")} />}
                                     </FormSelect>
                                 </GridItem>
-                                <GridItem span={8}>
+                                <GridItem span={7}>
                                     { this.state.searchSuffix !== this.state.searchBase ? <Label onClose={this.handleClearSearchBase} className="ds-left-margin" color="blue">{this.state.searchBase}</Label> : "" }
                                 </GridItem>
                             </Grid>
                         </div>
                     </Grid>
                     <Grid className="ds-margin-left">
-                        <GridItem span={12}>
+                        <GridItem span={5}>
                             <div className="ds-container">
                                 <ToggleGroup aria-label="Default with single selectable">
                                     <ToggleGroupItem

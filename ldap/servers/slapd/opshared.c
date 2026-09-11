@@ -16,7 +16,7 @@
 #include "log.h"
 #include "slap.h"
 
-#ifdef SYSTEMTAP
+#ifdef USDT
 #include <sys/sdt.h>
 #endif
 
@@ -278,7 +278,7 @@ op_shared_search(Slapi_PBlock *pb, int send_result)
     be_list[0] = NULL;
     referral_list[0] = NULL;
 
-#ifdef SYSTEMTAP
+#ifdef USDT
     STAP_PROBE(ns-slapd, op_shared_search__entry);
 #endif
 
@@ -556,6 +556,18 @@ op_shared_search(Slapi_PBlock *pb, int send_result)
                 pr_be = pagedresults_get_current_be(pb_conn, pr_idx);
                 if (be_name) {
                     if (pr_be != be_single) {
+                        if (pr_be == NULL) {
+                            slapi_log_err(SLAPI_LOG_ERR, "op_shared_search",
+                                          "Paged-results slot %d: cookie in current search does "
+                                          "not match the previous searchRequest backend value.\n",
+                                          pr_idx);
+                            send_ldap_result(pb, LDAP_PROTOCOL_ERROR, NULL,
+                                             "Cookie in current search does not match "
+                                             "the previous searchRequest backend value",
+                                             0, NULL);
+                            rc = -1;
+                            goto free_and_return;
+                        }
                         if (be_single != NULL) {
                             slapi_be_Unlock(be_single);
                         }
@@ -689,7 +701,7 @@ op_shared_search(Slapi_PBlock *pb, int send_result)
         }
     }
 
-#ifdef SYSTEMTAP
+#ifdef USDT
     STAP_PROBE(ns-slapd, op_shared_search__prepared);
 #endif
 
@@ -1008,7 +1020,7 @@ op_shared_search(Slapi_PBlock *pb, int send_result)
         be = next_be; /* this be won't be used for PAGED_RESULTS */
     }
 
-#ifdef SYSTEMTAP
+#ifdef USDT
     STAP_PROBE(ns-slapd, op_shared_search__backends);
 #endif
 
@@ -1114,7 +1126,7 @@ free_and_return_nolock:
     slapi_ch_free_string(&proxydn);
     slapi_ch_free_string(&proxystr);
 
-#ifdef SYSTEMTAP
+#ifdef USDT
     STAP_PROBE(ns-slapd, op_shared_search__return);
 #endif
 }

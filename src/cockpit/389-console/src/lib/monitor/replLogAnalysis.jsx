@@ -84,8 +84,8 @@ export class ReplLogAnalysis extends React.Component {
             anonymizeOption: false,
             replicationFilter: "all", // 'all', 'only-fully', 'only-not'
             analysisPrecision: "balanced", // 'fast' | 'balanced' | 'full'
-            lagTimeLowest: "",
-            etimeLowest: "",
+            lagTimeLowest: "0",
+            etimeLowest: "0",
             utcOffset: "+0000",
             formatOptions: {
                 json: true,       // JSON format for PatternFly chart data
@@ -210,7 +210,7 @@ export class ReplLogAnalysis extends React.Component {
             }
 
             cockpit
-                .spawn(["test", "-d", path], { superuser: true, err: "message" })
+                .spawn(["test", "-d", path], { superuser: "require", err: "message" })
                 .then(() => resolve(true))
                 .catch(() => resolve(false));
         });
@@ -585,7 +585,7 @@ export class ReplLogAnalysis extends React.Component {
 
         // Execute command
         cockpit
-            .spawn(cmd, { superuser: true, err: "message" })
+            .spawn(cmd, { superuser: "require", err: "message" })
             .done(content => {
                 try {
                     let result;
@@ -749,7 +749,7 @@ export class ReplLogAnalysis extends React.Component {
         });
 
         cockpit
-            .spawn(["find", path, "-maxdepth", "1", "-type", "d", "-not", "-path", "*/\\.*"], { superuser: true, err: "message" })
+            .spawn(["find", path, "-maxdepth", "1", "-type", "d", "-not", "-path", "*/\\.*"], { superuser: "require", err: "message" })
             .then(output => {
                 const dirs = output.trim().split('\n')
                     .filter(dir => dir !== path) // Remove the current directory from the list
@@ -944,10 +944,15 @@ export class ReplLogAnalysis extends React.Component {
 
         // If empty or not a number, start from 0
         const numValue = (currentValue === "" || isNaN(parseFloat(currentValue))) ? 0 : parseFloat(currentValue);
+        const incr = 0.1;
 
         // Don't go below 0
         if (numValue > 0) {
-            const newValue = Math.max(0, numValue - 1);
+            let newValue = Number((numValue - incr).toFixed(1));
+            if (newValue < 0) {
+                newValue = 0;
+            }
+
             this.setState({
                 [id]: newValue,
                 errors: {
@@ -963,8 +968,8 @@ export class ReplLogAnalysis extends React.Component {
 
         // If empty or not a number, start from 0
         const numValue = (currentValue === "" || isNaN(parseFloat(currentValue))) ? 0 : parseFloat(currentValue);
-
-        const newValue = numValue + 1;
+        const incr = 0.1;
+        const newValue = Number((numValue + incr).toFixed(1));
         this.setState({
             [id]: newValue,
             errors: {
@@ -1736,7 +1741,6 @@ export class ReplLogAnalysis extends React.Component {
                                                             id="lagTimeLowest"
                                                             value={this.state.lagTimeLowest}
                                                             min={0}
-                                                            step={0.1}
                                                             onMinus={() => this.handleNumberInputMinus("lagTimeLowest")}
                                                             onChange={(event) => this.handleNumberInputChange("lagTimeLowest", event)}
                                                             onPlus={() => this.handleNumberInputPlus("lagTimeLowest")}
@@ -1770,7 +1774,6 @@ export class ReplLogAnalysis extends React.Component {
                                                             id="etimeLowest"
                                                             value={this.state.etimeLowest}
                                                             min={0}
-                                                            step={0.1}
                                                             onMinus={() => this.handleNumberInputMinus("etimeLowest")}
                                                             onChange={(event) => this.handleNumberInputChange("etimeLowest", event)}
                                                             onPlus={() => this.handleNumberInputPlus("etimeLowest")}
